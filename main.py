@@ -1,3 +1,13 @@
+if __name__ == "__main__":
+    print("启动 Upbit 大单监控机器人...")
+    print(f"监控币种: {len(MARKETS)} 个")
+    validate_markets()
+    
+    # ←←← 加这一行测试 Telegram 是否通
+    send_telegram("<b>测试消息</b>\n这是代码自动发的测试通知\n如果收到，说明 Telegram 配置 OK！")
+    
+    threading.Thread(target=start_websocket, daemon=True).start()
+    ...
 import json
 import uuid
 import threading
