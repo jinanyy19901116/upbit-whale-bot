@@ -8,10 +8,11 @@ from datetime import datetime
 import websocket  # pip install websocket-client requests
 
 # ==================== 配置 ====================
-UPBIT_REST = "https://sg-api.upbit.com"          # 日本 IP 推荐（稳定）
-# UPBIT_REST = "https://api.upbit.com"           # 如果用韩国代理或本地，可切换
+UPBIT_REST = "https://api.upbit.com"             # 韩国官方端点（主流币数据最多）
+# UPBIT_REST = "https://sg-api.upbit.com"        # 海外新加坡端点（备用）
 
-WS_URL = "wss://sg-api.upbit.com/websocket/v1"
+WS_URL = "wss://api.upbit.com/websocket/v1"      # 对应韩国 WS
+# WS_URL = "wss://sg-api.upbit.com/websocket/v1" # 备用
 
 BIG_TRADE_THRESHOLD = 50_000_000                 # 大单阈值 KRW
 
