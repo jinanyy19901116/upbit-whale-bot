@@ -84,7 +84,7 @@ def main():
         except:
             time.sleep(5)
 
-if name == "__main__":
+if __name__ == "__main__":
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         print("❌ 請在 Railway 設定 TELEGRAM_TOKEN 和 TELEGRAM_CHAT_ID")
     else:
