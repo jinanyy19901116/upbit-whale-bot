@@ -1,3 +1,39 @@
+# ==================== 主程序 ====================
+if __name__ == "__main__":
+    print("Upbit 大单监控机器人启动中...")
+    print(f"监控币种数量: {len(MARKETS)} 个")
+    
+    # 启动时验证市场（可选，但强烈建议保留）
+    validate_markets()
+    
+    # ─────────────── Telegram 测试 ───────────────
+    print("\n[测试] 正在发送 Telegram 测试消息...")
+    test_message = (
+        "<b>【机器人测试】</b>\n\n"
+        "✅ Upbit 大单监控程序已启动\n"
+        "时间： " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n"
+        "监控币种： " + str(len(MARKETS)) + " 个\n\n"
+        "如果 10 秒内收到此消息 → 配置正常\n"
+        "如果没收到 → 检查 Token / chat_id / Bot 对话权限"
+    )
+    
+    try:
+        send_telegram(test_message)
+        print("[测试] Telegram 发送请求已发出 → 请检查你的 Telegram 是否收到")
+        time.sleep(3)  # 给网络一点缓冲时间
+    except Exception as e:
+        print(f"[测试失败] Telegram 发送出错：{e}")
+    
+    print("─" * 50)
+    
+    # 正式启动 WebSocket 监控
+    threading.Thread(target=start_websocket, daemon=True).start()
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("程序已手动停止")
 import json
 import uuid
 import threading
