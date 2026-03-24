@@ -14,10 +14,6 @@ WS_URL = "wss://api.upbit.com/websocket/v1"
 BIG_TRADE_THRESHOLD = 20_000_000
 
 MARKETS = [
-    "KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE", 
-    "KRW-ADA", "KRW-SHIB", "KRW-AVAX", "KRW-LINK", "KRW-DOT",
-    "KRW-TRX", "KRW-SUI", "KRW-ATOM", "KRW-HBAR", "KRW-XLM",
-    "KRW-VET", "KRW-FIL", "KRW-ICP", "KRW-BCH",
     "KRW-SIGN", "KRW-SAHARA", "KRW-IP", "KRW-AKT", "KRW-ZETA",
     "KRW-KITE", "KRW-TAO", "KRW-CPOOL", "KRW-ATH", "KRW-SUN"
 ]
