@@ -1,3 +1,17 @@
+# 在文件最顶部 import 下面加这个测试函数
+def get_my_chat_id():
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        r = requests.get(url, timeout=10)
+        print("[DEBUG] getUpdates 返回:", r.json())
+        if r.json().get("result"):
+            chat_id = r.json()["result"][0]["message"]["chat"]["id"]
+            print(f"[DEBUG] 检测到的 chat_id 是: {chat_id}")
+    except Exception as e:
+        print("[DEBUG] 获取 chat_id 失败:", e)
+
+# 然后在 if __name__ == "__main__": 最开始调用
+get_my_chat_id()
 import json
 import uuid
 import threading
