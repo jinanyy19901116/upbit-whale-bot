@@ -11,7 +11,7 @@ import websocket  # pip install websocket-client requests
 UPBIT_REST = "https://api.upbit.com"             # 韩国官方端点（数据最全）
 WS_URL = "wss://api.upbit.com/websocket/v1"
 
-BIG_TRADE_THRESHOLD = 50_000_000
+BIG_TRADE_THRESHOLD = 20_000_000
 
 MARKETS = [
     "KRW-TRX", "KRW-XRP", "KRW-BTC", "KRW-ETH", "KRW-USDT", "KRW-SOL",
