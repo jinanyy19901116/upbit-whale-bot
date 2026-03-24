@@ -1,187 +1,133 @@
 import json
-import uuid
-import threading
 import time
-import gzip
+import threading
 import requests
 from datetime import datetime
-import websocket  # pip install websocket-client requests
+import websocket  # pip install websocket-client
 
-# ==================== 配置区（所有变量必须在这里定义） ====================
-UPBIT_REST = "https://api.upbit.com"             # 韩国官方端点（数据最全）
-WS_URL = "wss://api.upbit.com/websocket/v1"
-
-BIG_TRADE_THRESHOLD = 20_000_000
-
-MARKETS = [
-    "KRW-SIGN", "KRW-SAHARA", "KRW-IP", "KRW-AKT", "KRW-ZETA",
-    "KRW-KITE", "KRW-TAO", "KRW-CPOOL", "KRW-ATH", "KRW-SUN"
-]
-
+# ==================== 配置 ====================
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = 5671949305
 
-# ==================== Telegram 发送函数（加强版调试） ====================
+# 要监控的永续合约（USDT 本位）
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT", "SUIUSDT",
+    "TAOUSDT", "SIGNUSDT"   # ← 你关心的币种可以继续加在这里，例如 "KITEUSDT"
+]
+
+# 大单阈值（USDT）
+BIG_TRADE_THRESHOLD = 500000   # 50万美元以上，可改成 100000（10万）
+
+# 爆仓金额阈值（USDT）
+LIQUIDATION_THRESHOLD = 100000  # 10万美元以上爆仓提醒
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        print(f"[Telegram Debug] 状态码: {response.status_code}")
-        if response.status_code == 200:
-            print("[Telegram] ✅ 发送成功")
-        else:
-            result = response.json()
-            print(f"[Telegram] ❌ 发送失败: {result.get('description', '未知错误')}")
+        requests.post(url, json=payload, timeout=10)
+        print("[Telegram] 已推送")
     except Exception as e:
-        print(f"[Telegram] ❌ 异常: {type(e).__name__} - {e}")
+        print(f"[Telegram 失败]: {e}")
 
-# ==================== 获取真实 chat_id 调试函数 ====================
-def get_my_chat_id():
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        print("[DEBUG] getUpdates 返回内容:", data)
-        if data.get("result"):
-            chat_id = data["result"][0]["message"]["chat"]["id"]
-            print(f"[DEBUG] 检测到的真实 chat_id 是: {chat_id}")
-            print(f"[DEBUG] 你当前代码里写的 chat_id 是: {TELEGRAM_CHAT_ID}")
-        else:
-            print("[DEBUG] 目前没有新消息，请先用 Telegram 私聊你的 Bot 并发送 /start")
-    except Exception as e:
-        print(f"[DEBUG] 获取 chat_id 失败: {e}")
-
-# ==================== Upbit REST 验证 ====================
-def upbit_api(path: str, params: dict = None):
-    url = f"{UPBIT_REST}{path}"
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"REST API 错误 {path}: {e}")
-        return None
-
-def validate_markets():
-    print("正在验证市场有效性...")
-    markets_info = upbit_api("/v1/market/all")
-    if not markets_info:
-        print("无法获取市场列表，继续运行")
-        return
-    valid = {m["market"] for m in markets_info}
-    invalid = [m for m in MARKETS if m not in valid]
-    if invalid:
-        print(f"⚠️ 以下币种可能不存在：{', '.join(invalid[:10])} ... 等")
-    else:
-        print("所有币种验证通过")
-
-# ==================== WebSocket 部分（保持不变） ====================
+# ==================== WebSocket 回调 ====================
 def on_open(ws):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] WebSocket 已连接 → 订阅 {len(MARKETS)} 个币种...")
-    ticket = str(uuid.uuid4())
-    subscribe_payload = [
-        {"ticket": ticket},
-        {"type": "trade",    "codes": MARKETS},
-        {"type": "orderbook", "codes": [f"{m}.15" for m in MARKETS]},
-        {"type": "ticker",   "codes": MARKETS}
-    ]
-    ws.send(json.dumps(subscribe_payload))
-    print("订阅已发送")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Binance Futures WebSocket 已连接")
+    
+    # 订阅全市场爆仓流（最重要）
+    streams = [f"{s.lower()}@forceOrder" for s in SYMBOLS]          # 单个符号爆仓
+    streams.append("!forceOrder@arr")                               # 全市场爆仓（推荐）
+    streams.extend([f"{s.lower()}@aggTrade" for s in SYMBOLS])      # 大单监控
+    
+    payload = {
+        "method": "SUBSCRIBE",
+        "params": streams,
+        "id": 1
+    }
+    ws.send(json.dumps(payload))
+    print("已订阅：爆仓流 + 大单流")
 
 def on_message(ws, message):
-    if isinstance(message, bytes):
-        try:
-            message = gzip.decompress(message).decode('utf-8')
-        except:
-            return
     try:
-        data_list = json.loads(message)
-        if not isinstance(data_list, list):
-            data_list = [data_list]
-        for data in data_list:
-            t = data.get("type")
-            if t == "trade":
-                handle_trade(data)
-            elif t == "orderbook":
-                handle_orderbook(data)
-            elif t == "ticker":
-                handle_ticker(data)
+        data = json.loads(message)
+        
+        # 处理爆仓事件
+        if data.get("e") == "forceOrder" or (isinstance(data, list) and data[0].get("e") == "forceOrder"):
+            order = data if isinstance(data, dict) else data[0]
+            qty = float(order.get("q", 0))
+            price = float(order.get("p", 0))
+            amount = qty * price
+            symbol = order.get("s", "UNKNOWN")
+            
+            if amount >= LIQUIDATION_THRESHOLD:
+                side = "多单爆仓" if order.get("S") == "SELL" else "空单爆仓"
+                msg = f"""
+<b>💥 Binance 爆仓警报！</b>
+{symbol} {side}
+金额：${amount:,.0f} USDT
+价格：{price:,.4f}
+时间：{datetime.now().strftime('%H:%M:%S')}
+🔗 https://www.binance.com/en/futures/{symbol}
+                """.strip()
+                print(f"爆仓触发 → {symbol} ${amount:,.0f}")
+                send_telegram(msg)
+        
+        # 处理大单（aggTrade）
+        elif data.get("e") == "aggTrade":
+            symbol = data.get("s")
+            qty = float(data.get("q", 0))
+            price = float(data.get("p", 0))
+            amount = qty * price
+            is_buyer_maker = data.get("m", False)  # True=卖方主动
+            
+            if amount >= BIG_TRADE_THRESHOLD:
+                direction = "大额买入" if not is_buyer_maker else "大额卖出"
+                msg = f"""
+<b>🚨 Binance 大单警报！</b>
+{symbol} {direction}
+金额：${amount:,.0f} USDT
+数量：{qty:,.2f}
+价格：{price:,.4f}
+时间：{datetime.now().strftime('%H:%M:%S')}
+                """.strip()
+                print(f"大单触发 → {symbol} ${amount:,.0f}")
+                send_telegram(msg)
+                
     except Exception as e:
-        print("消息处理错误:", e)
-
-def handle_trade(data):
-    code = data.get("code")
-    if not code: return
-    price = float(data.get("trade_price", 0))
-    volume = float(data.get("trade_volume", 0))
-    amount = price * volume
-    if amount < BIG_TRADE_THRESHOLD: return
-    ts = datetime.fromtimestamp(data.get("trade_timestamp", 0) / 1000)
-    direction = "买单（BID）" if data.get("ask_bid") == "BID" else "卖单（ASK）"
-    msg = f"""
-<b>大单触发！</b> {direction}
-币种：{code}
-📈 价格：{price:,.0f} KRW
-📦 成交量：{volume:.6f} {code.split('-')[1]}
-金额：{amount:,.0f} KRW
-🕒 时间：{ts.strftime('%H:%M:%S')}
-🔗 https://upbit.com/exchange?code=CRIX.UPBIT.{code}
-    """.strip()
-    print(msg.replace("<b>", "").replace("</b>", ""))
-    threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
-
-def handle_orderbook(data):
-    code = data.get("code")
-    units = data.get("orderbook_units", [])
-    if units:
-        print(f"[{code}] 订单簿 | 买一 {units[0].get('bid_price',0):,.0f} | 卖一 {units[0].get('ask_price',0):,.0f}")
-
-def handle_ticker(data):
-    code = data.get("code")
-    price = data.get("trade_price")
-    print(f"[{code}] Ticker | 当前价 {price:,.0f} KRW")
+        pass  # 忽略解析错误
 
 def on_error(ws, error):
     print("WebSocket 错误:", error)
 
-def on_close(ws, *args):
+def on_close(ws, close_status_code, close_msg):
     print("WebSocket 关闭 → 5秒后重连")
     time.sleep(5)
-    start_websocket()
+    start_ws()
 
-def start_websocket():
-    ws_app = websocket.WebSocketApp(
-        WS_URL,
+def start_ws():
+    ws = websocket.WebSocketApp(
+        "wss://fstream.binance.com/ws",
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
-    ws_app.run_forever(ping_interval=30, ping_timeout=10)
+    ws.run_forever(ping_interval=30, ping_timeout=10)
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    print("Upbit 大单监控机器人启动中...")
-    print(f"监控币种数量: {len(MARKETS)} 个")
+    print("Binance Futures 合约监控机器人启动中...")
+    print(f"监控合约: {len(SYMBOLS)} 个")
+    print(f"大单阈值: ${BIG_TRADE_THRESHOLD:,} USDT")
+    print(f"爆仓阈值: ${LIQUIDATION_THRESHOLD:,} USDT")
     
-    validate_markets()
+    start_msg = f"<b>🚀 Binance Futures 监控已启动</b>\n监控合约：{len(SYMBOLS)} 个\n大单阈值：${BIG_TRADE_THRESHOLD:,}\n爆仓阈值：${LIQUIDATION_THRESHOLD:,}"
+    send_telegram(start_msg)
     
-    # Telegram 测试
-    print("\n[Telegram 测试] 正在发送测试消息...")
-    get_my_chat_id()                     # 先打印真实 chat_id
-    test_msg = f"<b>【机器人启动测试】</b>\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n监控币种：{len(MARKETS)} 个\n请检查是否收到此消息"
-    send_telegram(test_msg)
-    
-    print("─" * 60)
-    
-    # 启动 WebSocket
-    threading.Thread(target=start_websocket, daemon=True).start()
+    threading.Thread(target=start_ws, daemon=True).start()
     
     try:
         while True:
