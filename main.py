@@ -23,7 +23,7 @@ SYMBOLS = [
 ]
 
 # 阈值设置（USDT）
-BIG_TRADE_THRESHOLD = 500000      # 大单阈值：10万美元（可调低测试）
+BIG_TRADE_THRESHOLD = 100000      # 大单阈值：10万美元（可调低测试）
 LIQUIDATION_THRESHOLD = 100000    # 爆仓阈值：10万美元
 
 # 北京时间
