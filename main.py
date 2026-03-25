@@ -2,15 +2,19 @@ import requests
 import time
 import logging
 from collections import defaultdict, deque
+from datetime import datetime, timezone, timedelta
 
 # ------------------- Telegram -------------------
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
 # ------------------- 参数 -------------------
-BIG_TRADE_THRESHOLD = 27_000_000   # 单笔大单
-BURST_THRESHOLD = 80_000_000       # 3秒累计（拉盘信号）
-TIME_WINDOW = 3                    # 秒
+BIG_TRADE = 27_000_000
+BURST = 80_000_000
+ACCUMULATION = 100_000_000
+
+TIME_WINDOW = 3
+ACC_WINDOW = 10
 
 REQUEST_INTERVAL = 0.15
 LOOP_INTERVAL = 1
@@ -21,162 +25,164 @@ logging.basicConfig(level=logging.INFO,
 
 logging.info("程序启动")
 
+# ------------------- 时间 -------------------
+def bj_time(ts):
+    utc = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+    bj = utc.astimezone(timezone(timedelta(hours=8)))
+    return bj.strftime("%H:%M:%S")
+
 # ------------------- Telegram -------------------
-def send_telegram(msg):
+def tg(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        logging.error(f"TG错误: {e}")
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except:
+        pass
 
-send_telegram("✅ 拉盘监控系统已启动")
+tg("✅ 交易级监控系统启动")
 
-# ------------------- 获取市场 -------------------
-def get_top30_markets():
+# ------------------- 获取Top30 -------------------
+def get_top30():
     try:
-        # 获取全部市场
-        all_markets = requests.get(
-            "https://api.upbit.com/v1/market/all", timeout=10
-        ).json()
-
-        krw_markets = [
-            m["market"] for m in all_markets
-            if m["market"].startswith("KRW-") and m["market"] not in ["KRW-BTC", "KRW-ETH"]
-        ]
+        all_m = requests.get("https://api.upbit.com/v1/market/all").json()
+        krw = [m["market"] for m in all_m if m["market"].startswith("KRW-") and m["market"] not in ["KRW-BTC","KRW-ETH"]]
 
         result = []
-
-        # 获取成交额
-        for m in krw_markets:
+        for m in krw:
             try:
-                url = f"https://api.upbit.com/v1/ticker?markets={m}"
-                r = requests.get(url, timeout=5)
-
-                if r.status_code != 200:
-                    continue
-
-                data = r.json()
-                if not isinstance(data, list):
-                    continue
-
-                volume = data[0].get("acc_trade_price_24h", 0)
-                result.append((m, volume))
-
+                data = requests.get(f"https://api.upbit.com/v1/ticker?markets={m}").json()
+                vol = data[0]["acc_trade_price_24h"]
+                result.append((m, vol))
                 time.sleep(0.05)
-
             except:
                 continue
 
-        # 排序取前30
         result.sort(key=lambda x: x[1], reverse=True)
-
-        top30 = [x[0] for x in result[:30]]
-
-        logging.info(f"TOP30币种加载完成: {top30}")
-        return top30
-
-    except Exception as e:
-        logging.error(f"获取市场失败: {e}")
+        return [x[0] for x in result[:30]]
+    except:
         return []
 
 # ------------------- 初始化 -------------------
-MARKETS = get_top30_markets()
+MARKETS = get_top30()
+last_ts = {m: 0 for m in MARKETS}
 
-last_timestamp = {m: 0 for m in MARKETS}
 burst_data = defaultdict(lambda: deque())
+acc_data = defaultdict(lambda: deque())
+trade_flow = defaultdict(lambda: deque())
+
+price_cache = defaultdict(lambda: deque())
 
 # ------------------- 主循环 -------------------
 while True:
     try:
         for market in MARKETS:
             try:
-                url = f"https://api.upbit.com/v1/trades/ticks?market={market}&count=10"
-                r = requests.get(url, timeout=10)
+                r = requests.get(f"https://api.upbit.com/v1/trades/ticks?market={market}&count=10")
 
                 if r.status_code != 200:
                     continue
 
-                try:
-                    ticks = r.json()
-                except:
-                    continue
-
+                ticks = r.json()
                 if not isinstance(ticks, list):
                     continue
 
-                for tick in reversed(ticks):
+                for t in reversed(ticks):
 
-                    if not isinstance(tick, dict):
+                    if not isinstance(t, dict):
                         continue
 
-                    ts = tick.get("timestamp")
-                    if not ts or ts <= last_timestamp[market]:
+                    ts = t.get("timestamp")
+                    if not ts or ts <= last_ts[market]:
                         continue
 
-                    price = tick.get("trade_price", 0)
-                    volume = tick.get("trade_volume", 0)
-                    ask_bid = tick.get("ask_bid", "")
+                    price = t.get("trade_price", 0)
+                    vol = t.get("trade_volume", 0)
+                    side = t.get("ask_bid", "")
 
-                    if price == 0 or volume == 0:
+                    if price == 0 or vol == 0:
                         continue
 
-                    amount = price * volume
-
-                    # 过滤机器人
-                    if volume < 0.01:
-                        continue
-
+                    amount = price * vol
                     now = time.time()
+                    time_str = bj_time(ts)
 
                     # ------------------- 大单 -------------------
-                    if amount >= BIG_TRADE_THRESHOLD:
-                        msg = (
-                            f"💰 大单\n"
-                            f"{market}\n"
-                            f"{price:,} KRW\n"
-                            f"{amount:,.0f}"
-                        )
+                    if amount >= BIG_TRADE:
+                        msg = f"💰大单 {market} {time_str} {amount:,.0f}"
                         logging.info(msg)
-                        send_telegram(msg)
+                        tg(msg)
 
-                    # ------------------- 拉盘检测 -------------------
-                    if ask_bid == "BID":  # 主动买入
+                    # ------------------- 拉盘 -------------------
+                    if side == "BID":
                         burst_data[market].append((now, amount))
 
-                        # 清理旧数据
                         while burst_data[market] and now - burst_data[market][0][0] > TIME_WINDOW:
                             burst_data[market].popleft()
 
                         total = sum(x[1] for x in burst_data[market])
 
-                        if total >= BURST_THRESHOLD:
-                            msg = (
-                                f"🚀 拉盘预警\n"
-                                f"{market}\n"
-                                f"{TIME_WINDOW}秒买入: {total:,.0f}"
-                            )
+                        if total >= BURST:
+                            msg = f"🚀拉盘 {market} {time_str} {total:,.0f}"
                             logging.warning(msg)
-                            send_telegram(msg)
-
+                            tg(msg)
                             burst_data[market].clear()
 
-                    last_timestamp[market] = ts
+                    # ------------------- 吸筹 -------------------
+                    if side == "BID":
+                        acc_data[market].append((now, amount))
+
+                        while acc_data[market] and now - acc_data[market][0][0] > ACC_WINDOW:
+                            acc_data[market].popleft()
+
+                        acc_total = sum(x[1] for x in acc_data[market])
+
+                        if acc_total >= ACCUMULATION:
+                            msg = f"🟢吸筹 {market} {time_str} {acc_total:,.0f}"
+                            logging.info(msg)
+                            tg(msg)
+                            acc_data[market].clear()
+
+                    # ------------------- 买卖比 -------------------
+                    trade_flow[market].append((now, amount, side))
+
+                    while trade_flow[market] and now - trade_flow[market][0][0] > ACC_WINDOW:
+                        trade_flow[market].popleft()
+
+                    buy = sum(x[1] for x in trade_flow[market] if x[2] == "BID")
+                    sell = sum(x[1] for x in trade_flow[market] if x[2] == "ASK")
+
+                    if buy + sell > 0:
+                        ratio = buy / (buy + sell)
+
+                        if ratio > 0.7:
+                            tg(f"📊强买 {market} 买占比 {ratio:.2f}")
+                        elif ratio < 0.3:
+                            tg(f"📊强卖 {market} 卖占比 {1-ratio:.2f}")
+
+                    # ------------------- 价格联动 -------------------
+                    price_cache[market].append((now, price))
+
+                    while price_cache[market] and now - price_cache[market][0][0] > 5:
+                        price_cache[market].popleft()
+
+                    if len(price_cache[market]) >= 2:
+                        old_price = price_cache[market][0][1]
+                        change = (price - old_price) / old_price
+
+                        if change > 0.01:
+                            tg(f"⚡上涨 {market} +{change*100:.2f}%")
+                        elif change < -0.01:
+                            tg(f"⚡下跌 {market} {change*100:.2f}%")
+
+                    last_ts[market] = ts
 
                 time.sleep(REQUEST_INTERVAL)
 
             except Exception as e:
-                logging.error(f"{market}异常: {e}")
-                time.sleep(0.5)
-
-        # 每5分钟刷新一次币种（防止新币）
-        if int(time.time()) % 300 == 0:
-            MARKETS = get_top30_markets()
+                logging.error(f"{market}错误 {e}")
 
         time.sleep(LOOP_INTERVAL)
 
-    except KeyboardInterrupt:
-        logging.info("程序停止")
-        break
     except Exception as e:
-        logging.error(f"主循环异常: {e}")
+        logging.error(f"主循环错误 {e}")
         time.sleep(2)
