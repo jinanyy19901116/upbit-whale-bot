@@ -1,8 +1,7 @@
-import logging
+import pyupbit
 import requests
 import time
-import pyupbit
-import json
+import logging
 
 # ------------------- Telegram 配置 -------------------
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
@@ -10,97 +9,54 @@ TELEGRAM_CHAT_ID = "5671949305"
 
 # ------------------- 大单阈值 & 监控币种 -------------------
 BIG_TRADE_THRESHOLD = 27_000_000  # KRW, 约20万美元
-
-MARKETS = [
-    "KRW-SIGN",
-    "KRW-CHZ",
-    "KRW-MANA",
-    "KRW-SAND",
-    "KRW-ENJ",
-    "KRW-AAVE",
-    "KRW-1INCH",
-    "KRW-CRV",
-    "KRW-ANKR",
-    "KRW-LOOM",
-]
+MARKETS = ["KRW-SIGN", "KRW-CHZ", "KRW-MANA", "KRW-SAND", "KRW-ENJ"]
 
 # ------------------- 日志设置 -------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logging.info("程序启动")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ------------------- Telegram 推送 -------------------
-def send_telegram(message: str):
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, data=data)
-        if r.status_code == 200:
-            logging.info("Telegram 推送成功")
-        else:
+        if r.status_code != 200:
             logging.error(f"Telegram 推送失败: {r.text}")
     except Exception as e:
         logging.error(f"Telegram 异常: {e}")
 
-# 启动测试消息
 send_telegram("✅ Telegram 测试消息：大单监控程序已启动！")
 
-# ------------------- 机器人交易过滤 -------------------
-def is_human_trade(trade):
-    volume = trade.get("trade_volume", 0)
-    if volume < 0.01 or volume == int(volume):
-        return False
-    return True
+# ------------------- 轮询 REST API -------------------
+last_seen = {market: None for market in MARKETS}
 
-# ------------------- 实时监听成交 -------------------
-try:
-    wm = pyupbit.WebSocketManager("transaction", MARKETS)
-    logging.info("WebSocketManager 启动完成")
-
-    while True:
-        raw_data = wm.get()
-        if not raw_data:
-            time.sleep(0.1)
-            continue
-
-        try:
-            # 将 JSON 字符串转成字典
-            data = json.loads(raw_data)
-        except Exception as e:
-            logging.error(f"解析 JSON 错误: {e}, 数据: {raw_data}")
-            continue
-
-        price = data.get("trade_price") or data.get("price")
-        volume = data.get("trade_volume") or data.get("volume")
-        market = data.get("market") or data.get("code")
-
-        if price is None or volume is None or market is None:
-            continue
-
-        # 过滤机器人
-        if not is_human_trade({"trade_volume": volume}):
-            continue
-
-        amount = price * volume
-        if amount >= BIG_TRADE_THRESHOLD:
-            msg = (
-                f"💰 大单成交！\n"
-                f"交易对: {market}\n"
-                f"价格: {price:,} KRW\n"
-                f"数量: {volume}\n"
-                f"成交额: {amount:,} KRW"
-            )
-            logging.info(msg)
-            send_telegram(msg)
-
-except KeyboardInterrupt:
-    logging.info("程序手动停止")
-    wm.terminate()
-except Exception as e:
-    logging.error(f"异常退出: {e}")
+while True:
     try:
-        wm.terminate()
-    except:
-        pass
+        for market in MARKETS:
+            ticks = pyupbit.get_ticks(market, count=10)  # 最近10笔成交
+            for tick in reversed(ticks):  # 从旧到新
+                trade_time = tick['timestamp']
+                price = tick['trade_price']
+                volume = tick['trade_volume']
+                amount = price * volume
+
+                # 避免重复通知
+                if last_seen[market] is not None and trade_time <= last_seen[market]:
+                    continue
+
+                if amount >= BIG_TRADE_THRESHOLD:
+                    msg = f"💰 大单成交！\n交易对: {market}\n价格: {price:,} KRW\n数量: {volume}\n成交额: {amount:,} KRW"
+                    logging.info(msg)
+                    send_telegram(msg)
+
+                last_seen[market] = trade_time
+
+        time.sleep(5)  # 每5秒轮询一次
+
+    except KeyboardInterrupt:
+        logging.info("程序手动停止")
+        break
+    except Exception as e:
+        logging.error(f"异常: {e}")
+        time.sleep(5)
