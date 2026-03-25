@@ -8,18 +8,32 @@ TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
 MIN_USD = 200000
+NEW_COIN_USD = 100000
 KRW_TO_USD = 0.00075
 
-EXCLUDE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-USDT"]
+EXCLUDE = ["BTC", "ETH", "USDT"]
+
+# ================== 状态 ==================
+known_markets = set()
+new_coin_watchlist = {}
+
+trade_history = {}
+seen = set()
+
+buy_flow = {}
+last_price = {}
 
 # ================== 日志 ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ================== 工具 ==================
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
+        )
     except:
         pass
 
@@ -37,8 +51,64 @@ def format_price(x):
         return f"{x:.4f}"
     return f"{x:.6f}"
 
-def price_to_usdt(price_krw):
-    return price_krw * KRW_TO_USD
+def price_to_usdt(p):
+    return p * KRW_TO_USD
+
+# ================== 机器人过滤 ==================
+def is_bot_trade(symbol, usd, side):
+    if symbol not in trade_history:
+        trade_history[symbol] = []
+
+    trade_history[symbol].append((usd, side, time.time()))
+    trade_history[symbol] = trade_history[symbol][-10:]
+
+    amounts = [round(x[0], -3) for x in trade_history[symbol]]
+
+    if amounts.count(amounts[-1]) >= 3:
+        return True
+
+    return False
+
+def is_arbitrage(symbol):
+    if symbol not in trade_history:
+        return False
+
+    sides = [x[1] for x in trade_history[symbol]]
+    flips = sum(1 for i in range(len(sides)-1) if sides[i] != sides[i+1])
+
+    return flips >= 4
+
+def is_fake_pump(absorb, pump, confirm):
+    return absorb and pump and not confirm
+
+# ================== 新币检测 ==================
+def check_new_listings():
+    global known_markets, new_coin_watchlist
+
+    try:
+        res = requests.get("https://api.upbit.com/v1/market/all", timeout=5).json()
+        current = set([m["market"] for m in res if m["market"].startswith("KRW-")])
+
+        if not known_markets:
+            known_markets = current
+            return
+
+        new = current - known_markets
+
+        for m in new:
+            symbol = m.replace("KRW-", "")
+            if any(x in symbol for x in EXCLUDE):
+                continue
+
+            new_coin_watchlist[symbol] = time.time()
+
+            msg = f"🆕 新币上线\n{symbol}/USDT\n🔥 重点观察30分钟"
+            send_telegram(msg)
+
+        known_markets = current
+
+    except Exception as e:
+        logging.error(f"新币检测失败: {e}")
 
 # ================== 市场 ==================
 def get_top_markets():
@@ -47,14 +117,14 @@ def get_top_markets():
     krw = [
         m["market"] for m in markets
         if m["market"].startswith("KRW-")
-        and m["market"] not in EXCLUDE_MARKETS
+        and not any(x in m["market"] for x in EXCLUDE)
     ]
 
     tickers = requests.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(krw)}).json()
 
-    sorted_markets = sorted(tickers, key=lambda x: x["acc_trade_price_24h"], reverse=True)
+    sorted_m = sorted(tickers, key=lambda x: x["acc_trade_price_24h"], reverse=True)
 
-    return [m["market"] for m in sorted_markets[:30]]
+    return [m["market"] for m in sorted_m[:30]]
 
 def get_trades(market):
     try:
@@ -68,24 +138,24 @@ def get_trades(market):
 
 def get_binance_price(symbol):
     try:
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
-        return float(requests.get(url, timeout=3).json()["price"])
+        return float(requests.get(
+            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT",
+            timeout=3
+        ).json()["price"])
     except:
         return None
 
 # ================== 主逻辑 ==================
 def run():
-    logging.info("启动（信号系统版）")
-    send_telegram("🚀 信号系统已启动")
+    logging.info("终极系统启动")
+    send_telegram("🚀 系统启动成功")
 
     markets = get_top_markets()
-    seen = set()
-
-    buy_flow = {}
-    last_price = {}
 
     while True:
         try:
+            check_new_listings()
+
             for market in markets:
                 trades = get_trades(market)
 
@@ -100,14 +170,28 @@ def run():
                         volume = t["trade_volume"]
                         side = t["ask_bid"]
 
+                        symbol = market.replace("KRW-", "")
                         usd = price * volume * KRW_TO_USD
-                        if usd < MIN_USD:
+
+                        # ===== 新币阈值 =====
+                        threshold = MIN_USD
+                        if symbol in new_coin_watchlist:
+                            if time.time() - new_coin_watchlist[symbol] < 1800:
+                                threshold = NEW_COIN_USD
+
+                        if usd < threshold:
                             continue
 
-                        symbol = market.replace("KRW-", "")
+                        # ===== 机器人过滤 =====
+                        if is_bot_trade(symbol, usd, side):
+                            continue
+
+                        if is_arbitrage(symbol):
+                            continue
+
                         price_usdt = price_to_usdt(price)
 
-                        # ===== 买卖方向 =====
+                        # ===== 买卖 =====
                         side_str = "🟢买单" if side == "BID" else "🔴卖单"
 
                         # ===== 时间 =====
@@ -143,28 +227,20 @@ def run():
                             premium = diff * 100
                             confirm = abs(diff) < 1
 
-                        # ===== 评分系统 =====
+                        # ===== 假拉盘过滤 =====
+                        if is_fake_pump(absorb, pump, confirm):
+                            continue
+
+                        # ===== 评分 =====
                         score = 0
+                        if usd > 300000: score += 20
+                        elif usd > 200000: score += 10
+                        if absorb: score += 25
+                        if pump: score += 25
+                        if confirm: score += 20
+                        if premium > 2: score += 10
 
-                        if usd > 300000:
-                            score += 20
-                        elif usd > 200000:
-                            score += 10
-
-                        if absorb:
-                            score += 25
-
-                        if pump:
-                            score += 25
-
-                        if confirm:
-                            score += 20
-
-                        if premium > 2:
-                            score += 10
-
-                        # ===== 信号等级 =====
-                        level = ""
+                        # ===== 等级 =====
                         if score >= 90:
                             level = "🔴极强"
                         elif score >= 75:
@@ -174,7 +250,7 @@ def run():
                         else:
                             level = "⚪普通"
 
-                        # ===== 买入提示 =====
+                        # ===== 买点 =====
                         buy_signal = ""
                         if absorb and pump and confirm and side == "BID":
                             buy_signal = "🟢买入信号"
