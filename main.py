@@ -2,15 +2,15 @@ import logging
 import requests
 import time
 import pyupbit
+import json
 
 # ------------------- Telegram 配置 -------------------
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
 # ------------------- 大单阈值 & 监控币种 -------------------
-BIG_TRADE_THRESHOLD = 27_000_000  # KRW，大约 20万美元
+BIG_TRADE_THRESHOLD = 27_000_000  # KRW, 约20万美元
 
-# 小币种列表
 MARKETS = [
     "KRW-SIGN",
     "KRW-CHZ",
@@ -44,7 +44,7 @@ def send_telegram(message: str):
     except Exception as e:
         logging.error(f"Telegram 异常: {e}")
 
-# 启动测试推送
+# 启动测试消息
 send_telegram("✅ Telegram 测试消息：大单监控程序已启动！")
 
 # ------------------- 机器人交易过滤 -------------------
@@ -56,23 +56,28 @@ def is_human_trade(trade):
 
 # ------------------- 实时监听成交 -------------------
 try:
-    # 1. 使用 WebSocketManager 订阅成交数据
     wm = pyupbit.WebSocketManager("transaction", MARKETS)
-
     logging.info("WebSocketManager 启动完成")
 
     while True:
-        data = wm.get()  # 每次返回一个成交事件
-        if not data:
+        raw_data = wm.get()
+        if not raw_data:
             time.sleep(0.1)
             continue
 
-        # 交易类型字段可能是 "trade_price"/"trade_volume" 或者不同字段名
+        try:
+            # 将 JSON 字符串转成字典
+            data = json.loads(raw_data)
+        except Exception as e:
+            logging.error(f"解析 JSON 错误: {e}, 数据: {raw_data}")
+            continue
+
         price = data.get("trade_price") or data.get("price")
         volume = data.get("trade_volume") or data.get("volume")
+        market = data.get("market") or data.get("code")
 
-        if price is None or volume is None:
-            continue  # 无效记录就跳过
+        if price is None or volume is None or market is None:
+            continue
 
         # 过滤机器人
         if not is_human_trade({"trade_volume": volume}):
@@ -82,7 +87,7 @@ try:
         if amount >= BIG_TRADE_THRESHOLD:
             msg = (
                 f"💰 大单成交！\n"
-                f"交易对: {data.get('market') or data.get('code')}\n"
+                f"交易对: {market}\n"
                 f"价格: {price:,} KRW\n"
                 f"数量: {volume}\n"
                 f"成交额: {amount:,} KRW"
