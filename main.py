@@ -1,8 +1,6 @@
-import websocket
-import json
+import requests
 import threading
 import time
-import requests
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -18,7 +16,7 @@ TELEGRAM_CHAT_ID = "5671949305"
 MIN_USD = 20000
 BIG_USD = 200000
 ACCUM_USD = 300000
-EXCHANGE_RATE = 1300
+EXCHANGE_RATE = 1300  # KRW->USD兜底汇率
 
 BLACKLIST = ["BTC", "ETH", "USDT"]
 
@@ -34,8 +32,8 @@ def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"Telegram发送失败: {e}")
 
 def now_bj():
     return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
@@ -128,17 +126,17 @@ def get_price_fallback(coin, price_krw):
 # =========================
 # 处理成交信号
 # =========================
-def handle_trade(data):
+def handle_trade(trade):
     try:
-        if "cd" not in data:
+        market = trade.get("market")
+        if not market:
             return
-        market = data["cd"]
         coin = market.replace("KRW-", "")
         if coin in BLACKLIST:
             return
-        price_krw = data.get("tp", 0)
-        volume = data.get("tv", 0)
-        side = data.get("ab", "")
+        price_krw = trade.get("trade_price", 0)
+        volume = trade.get("trade_volume", 0)
+        side = "BID" if trade.get("ask_bid","BID")=="BID" else "ASK"
         if volume == 0:
             return
 
@@ -176,54 +174,21 @@ def handle_trade(data):
         logging.error(f"处理失败: {e}")
 
 # =========================
-# WebSocket 高频
-# =========================
-def on_message(ws, message):
-    try:
-        if isinstance(message, bytes):
-            message = message.decode("utf-8")
-        data = json.loads(message)
-        if isinstance(data, dict):
-            handle_trade(data)
-    except Exception as e:
-        logging.error(f"WS错误: {e}")
-
-def run_ws():
-    while True:
-        try:
-            ws = websocket.WebSocketApp(
-                "wss://api.upbit.com/websocket/v1",
-                on_message=on_message
-            )
-            def on_open(ws):
-                ws.send(json.dumps([
-                    {"ticket":"test"},
-                    {"type":"trade","codes":markets}
-                ]))
-            ws.on_open = on_open
-            ws.run_forever(ping_interval=30)
-        except Exception as e:
-            logging.error(f"WS重连: {e}, 切换轮询模式")
-            run_rest_polling()
-        time.sleep(3)
-
-# =========================
-# REST 轮询备份模式
+# REST 轮询大单信号
 # =========================
 def run_rest_polling():
-    logging.info("启动 REST 轮询备份")
+    logging.info("启动 REST API 轮询")
     while True:
         for market in markets:
             try:
-                res = requests.get("https://api.upbit.com/v1/trades/ticks", params={"market": market, "count": 5}, timeout=5).json()
+                res = requests.get(
+                    "https://api.upbit.com/v1/trades/ticks",
+                    params={"market": market, "count": 5},
+                    timeout=5
+                ).json()
                 if isinstance(res, list):
                     for trade in res:
-                        handle_trade({
-                            "cd": market,
-                            "tp": trade.get("trade_price",0),
-                            "tv": trade.get("trade_volume",0),
-                            "ab": "BID" if trade.get("ask_bid","BID")=="BID" else "ASK"
-                        })
+                        handle_trade(trade)
             except Exception as e:
                 logging.error(f"{market} REST 轮询失败: {e}")
         time.sleep(5)  # 每5秒轮询一次
@@ -238,11 +203,14 @@ def main():
     send_telegram("✅ 系统启动成功")
     markets = get_top_markets()
 
+    # CoinGecko 价格更新
     threading.Thread(target=update_price, daemon=True).start()
-    threading.Thread(target=run_ws, daemon=True).start()
+    # REST 轮询大单
+    threading.Thread(target=run_rest_polling, daemon=True).start()
 
     while True:
         check_new_listing()
+        # 每5分钟更新Top30交易对
         if int(time.time()) % 300 == 0:
             markets = get_top_markets()
         time.sleep(30)
