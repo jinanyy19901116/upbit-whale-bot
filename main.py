@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =========================
-# Telegram 配置
+# 🔑 Telegram 配置
 # =========================
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
@@ -87,7 +87,7 @@ def check_new_listing():
         logging.error(f"新币检测失败: {e}")
 
 # =========================
-# CoinGecko 价格更新（限速保护版）
+# CoinGecko 价格更新（限速保护）
 # =========================
 def update_price():
     global price_usd
@@ -114,7 +114,7 @@ def update_price():
             price_usd = temp
         except Exception as e:
             logging.error(f"价格更新失败: {e}")
-        time.sleep(60)  # 每60秒更新一次，避免限速
+        time.sleep(60)
 
 # =========================
 # Fallback价格
@@ -203,8 +203,30 @@ def run_ws():
             ws.on_open = on_open
             ws.run_forever(ping_interval=30)
         except Exception as e:
-            logging.error(f"WS重连: {e}")
+            logging.error(f"WS重连: {e}, 切换轮询模式")
+            run_rest_polling()
         time.sleep(3)
+
+# =========================
+# REST 轮询备份模式
+# =========================
+def run_rest_polling():
+    logging.info("启动 REST 轮询备份")
+    while True:
+        for market in markets:
+            try:
+                res = requests.get("https://api.upbit.com/v1/trades/ticks", params={"market": market, "count": 5}, timeout=5).json()
+                if isinstance(res, list):
+                    for trade in res:
+                        handle_trade({
+                            "cd": market,
+                            "tp": trade.get("trade_price",0),
+                            "tv": trade.get("trade_volume",0),
+                            "ab": "BID" if trade.get("ask_bid","BID")=="BID" else "ASK"
+                        })
+            except Exception as e:
+                logging.error(f"{market} REST 轮询失败: {e}")
+        time.sleep(5)  # 每5秒轮询一次
 
 # =========================
 # 主程序
