@@ -7,39 +7,33 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =========================
-# 🔑 Telegram 配置（自己填）
+# 🔑 Telegram（自己填）
 # =========================
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
 # =========================
-# ⚙️ 参数配置
+# ⚙️ 参数
 # =========================
-MIN_USD = 50000        # 最低提醒（降低了，保证有信号）
-BIG_USD = 200000       # 大单
-ACCUM_USD = 300000     # 吸筹识别
+MIN_USD = 20000
+BIG_USD = 200000
+ACCUM_USD = 300000
 
-EXCHANGE_RATE = 1300   # KRW → USD（备用）
+EXCHANGE_RATE = 1300
 
-# =========================
-# 🪙 屏蔽交易对
-# =========================
 BLACKLIST = ["BTC", "ETH", "USDT"]
 
-# =========================
-# 🌍 全局变量
-# =========================
 markets = []
 known_markets = set()
 accum_data = {}
 binance_price = {}
 
 # =========================
-# 🧰 工具函数
+# 📩 Telegram
 # =========================
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": msg
@@ -48,12 +42,18 @@ def send_telegram(msg):
         pass
 
 
+# =========================
+# 🕒 北京时间
+# =========================
 def now_bj():
-    return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(
-        timezone(timedelta(hours=8))
-    ).strftime("%H:%M:%S")
+    return datetime.utcnow().replace(tzinfo=timezone.utc)\
+        .astimezone(timezone(timedelta(hours=8)))\
+        .strftime("%H:%M:%S")
 
 
+# =========================
+# 💰 格式化
+# =========================
 def format_usd(x):
     if x >= 1_000_000:
         return f"${x/1_000_000:.2f}M"
@@ -63,11 +63,10 @@ def format_usd(x):
 
 
 # =========================
-# 🚀 获取Top30交易对
+# 🚀 获取Top30
 # =========================
 def get_top_markets():
     try:
-        url = "https://api.upbit.com/v1/ticker"
         all_markets = requests.get("https://api.upbit.com/v1/market/all").json()
 
         krw_markets = [
@@ -76,17 +75,20 @@ def get_top_markets():
             and not any(x in m for x in BLACKLIST)
         ]
 
-        res = requests.get(url, params={"markets": ",".join(krw_markets)}).json()
+        res = requests.get(
+            "https://api.upbit.com/v1/ticker",
+            params={"markets": ",".join(krw_markets)}
+        ).json()
+
+        if not isinstance(res, list):
+            return []
 
         res.sort(key=lambda x: x["acc_trade_price_24h"], reverse=True)
 
-        top = [r["market"] for r in res[:30]]
-
-        logging.info(f"当前监控: {top}")
-        return top
+        return [r["market"] for r in res[:30]]
 
     except Exception as e:
-        logging.error(f"获取市场失败: {e}")
+        logging.error(f"市场获取失败: {e}")
         return []
 
 
@@ -98,7 +100,11 @@ def check_new_listing():
 
     try:
         res = requests.get("https://api.upbit.com/v1/market/all").json()
-        current = set([m["market"] for m in res if m["market"].startswith("KRW-")])
+
+        current = set([
+            m["market"] for m in res
+            if m["market"].startswith("KRW-")
+        ])
 
         if not known_markets:
             known_markets = current
@@ -110,10 +116,10 @@ def check_new_listing():
             if any(x in m for x in BLACKLIST):
                 continue
 
-            symbol = m.replace("KRW-", "")
+            coin = m.replace("KRW-", "")
 
             send_telegram(
-                f"🆕 新币上线\n{symbol}/USDT\n⚠️ 注意首波波动"
+                f"🆕 新币上线\n{coin}/USDT\n⚠️ 注意波动"
             )
 
         known_markets = current
@@ -123,19 +129,39 @@ def check_new_listing():
 
 
 # =========================
-# 💰 币安价格（校准）
+# 💰 币安价格（修复版）
 # =========================
 def update_binance_price():
     global binance_price
+
     while True:
         try:
             url = "https://api.binance.com/api/v3/ticker/price"
-            res = requests.get(url, timeout=5).json()
+            res = requests.get(url, timeout=5)
 
-            for item in res:
-                if item["symbol"].endswith("USDT"):
-                    coin = item["symbol"].replace("USDT", "")
-                    binance_price[coin] = float(item["price"])
+            if res.status_code != 200:
+                logging.error(f"币安HTTP错误: {res.status_code}")
+                time.sleep(5)
+                continue
+
+            data = res.json()
+
+            if not isinstance(data, list):
+                logging.error(f"币安返回异常: {data}")
+                time.sleep(5)
+                continue
+
+            temp = {}
+
+            for item in data:
+                symbol = item.get("symbol")
+                price = item.get("price")
+
+                if symbol and price and symbol.endswith("USDT"):
+                    coin = symbol.replace("USDT", "")
+                    temp[coin] = float(price)
+
+            binance_price = temp
 
         except Exception as e:
             logging.error(f"币安价格失败: {e}")
@@ -144,7 +170,7 @@ def update_binance_price():
 
 
 # =========================
-# 🧠 信号处理
+# 🧠 交易处理
 # =========================
 def handle_trade(data):
     try:
@@ -161,7 +187,10 @@ def handle_trade(data):
         volume = data.get("tv", 0)
         side = data.get("ab", "")
 
-        # ===== 用币安价格 =====
+        if volume == 0:
+            return
+
+        # ===== 优先币安价格 =====
         if coin in binance_price:
             price_usd = binance_price[coin]
         else:
@@ -172,40 +201,30 @@ def handle_trade(data):
         if usd < MIN_USD:
             return
 
-        # =========================
-        # 🧠 吸筹识别
-        # =========================
+        # ===== 吸筹识别 =====
         now = time.time()
-        accum = accum_data.get(coin, {"usd": 0, "time": now})
+        acc = accum_data.get(coin, {"usd": 0, "time": now})
 
-        if now - accum["time"] < 60:
-            accum["usd"] += usd
+        if now - acc["time"] < 60:
+            acc["usd"] += usd
         else:
-            accum = {"usd": usd, "time": now}
+            acc = {"usd": usd, "time": now}
 
-        accum_data[coin] = accum
+        accum_data[coin] = acc
 
-        # =========================
-        # 🟢 买卖判断
-        # =========================
         side_str = "🟢买入" if side == "BID" else "🔴卖出"
 
-        # =========================
-        # 🚀 信号评分
-        # =========================
+        # ===== 信号评分 =====
         score = 0
-
         if usd > BIG_USD:
             score += 2
-        if accum["usd"] > ACCUM_USD:
+        if acc["usd"] > ACCUM_USD:
             score += 2
 
         if score < 2:
             return
 
-        # =========================
-        # 📩 Telegram消息
-        # =========================
+        # ===== 消息 =====
         msg = (
             f"{coin}/USDT\n"
             f"{side_str}\n"
@@ -217,7 +236,7 @@ def handle_trade(data):
         send_telegram(msg)
 
     except Exception as e:
-        logging.error(f"处理错误: {e}")
+        logging.error(f"处理失败: {e}")
 
 
 # =========================
@@ -234,7 +253,7 @@ def on_message(ws, message):
             handle_trade(data)
 
     except Exception as e:
-        logging.error(f"WS解析错误: {e}")
+        logging.error(f"WS错误: {e}")
 
 
 def run_ws():
@@ -246,18 +265,17 @@ def run_ws():
             )
 
             def on_open(ws):
-                subscribe = [
+                ws.send(json.dumps([
                     {"ticket": "test"},
                     {"type": "trade", "codes": markets}
-                ]
-                ws.send(json.dumps(subscribe))
+                ]))
 
             ws.on_open = on_open
 
             ws.run_forever(ping_interval=30)
 
         except Exception as e:
-            logging.error(f"WS断开重连: {e}")
+            logging.error(f"WS重连: {e}")
 
         time.sleep(3)
 
@@ -269,9 +287,9 @@ def main():
     global markets
 
     logging.basicConfig(level=logging.INFO)
-    logging.info("🚀 程序启动")
+    logging.info("🚀 启动")
 
-    send_telegram("✅ 监控系统已启动")
+    send_telegram("✅ 系统启动成功")
 
     markets = get_top_markets()
 
@@ -281,7 +299,7 @@ def main():
     while True:
         check_new_listing()
 
-        # 每5分钟更新交易对
+        # 每5分钟刷新
         if int(time.time()) % 300 == 0:
             markets = get_top_markets()
 
