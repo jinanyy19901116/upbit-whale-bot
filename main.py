@@ -20,8 +20,8 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        logging.error(f"Telegram失败: {e}")
+    except:
+        pass
 
 def format_usd(x):
     if x >= 1_000_000:
@@ -40,7 +40,7 @@ def format_price(x):
 def price_to_usdt(price_krw):
     return price_krw * KRW_TO_USD
 
-# ================== 市场数据 ==================
+# ================== 市场 ==================
 def get_top_markets():
     markets = requests.get("https://api.upbit.com/v1/market/all").json()
 
@@ -66,7 +66,6 @@ def get_trades(market):
     except:
         return []
 
-# ================== Binance价格 ==================
 def get_binance_price(symbol):
     try:
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
@@ -76,13 +75,12 @@ def get_binance_price(symbol):
 
 # ================== 主逻辑 ==================
 def run():
-    logging.info("程序启动")
-    send_telegram("✅ 系统已启动（终极版）")
+    logging.info("启动（信号系统版）")
+    send_telegram("🚀 信号系统已启动")
 
     markets = get_top_markets()
     seen = set()
 
-    # 状态缓存
     buy_flow = {}
     last_price = {}
 
@@ -109,57 +107,87 @@ def run():
                         symbol = market.replace("KRW-", "")
                         price_usdt = price_to_usdt(price)
 
-                        # ================== 买卖方向 ==================
+                        # ===== 买卖方向 =====
                         side_str = "🟢买单" if side == "BID" else "🔴卖单"
 
-                        # ================== 时间 ==================
+                        # ===== 时间 =====
                         ts = t["timestamp"] / 1000
                         dt = datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=8)
                         time_str = dt.strftime("%H:%M:%S")
 
-                        # ================== 吸筹检测 ==================
-                        if symbol not in buy_flow:
-                            buy_flow[symbol] = 0
-
+                        # ===== 吸筹 =====
+                        buy_flow[symbol] = buy_flow.get(symbol, 0)
                         if side == "BID":
                             buy_flow[symbol] += 1
                         else:
                             buy_flow[symbol] = 0
 
-                        absorb_signal = "📦吸筹中" if buy_flow[symbol] >= 3 else ""
+                        absorb = buy_flow[symbol] >= 3
 
-                        # ================== 拉盘检测 ==================
-                        pump_signal = ""
+                        # ===== 拉盘 =====
+                        pump = False
                         if symbol in last_price:
                             change = (price - last_price[symbol]) / last_price[symbol]
-                            if change > 0.01:  # 1%瞬涨
-                                pump_signal = "🚀拉盘启动"
+                            if change > 0.01:
+                                pump = True
 
                         last_price[symbol] = price
 
-                        # ================== Binance确认 ==================
+                        # ===== Binance =====
                         binance_price = get_binance_price(symbol)
-                        confirm = ""
-                        premium = ""
+                        confirm = False
+                        premium = 0
 
                         if binance_price:
                             diff = (price_usdt - binance_price) / binance_price
+                            premium = diff * 100
+                            confirm = abs(diff) < 1
 
-                            if abs(diff) < 0.01:
-                                confirm = "✅同步上涨"
-                            else:
-                                confirm = "⚠️韩盘独立"
+                        # ===== 评分系统 =====
+                        score = 0
 
-                            premium = f"溢价:{diff*100:.2f}%"
+                        if usd > 300000:
+                            score += 20
+                        elif usd > 200000:
+                            score += 10
 
-                        # ================== 消息 ==================
+                        if absorb:
+                            score += 25
+
+                        if pump:
+                            score += 25
+
+                        if confirm:
+                            score += 20
+
+                        if premium > 2:
+                            score += 10
+
+                        # ===== 信号等级 =====
+                        level = ""
+                        if score >= 90:
+                            level = "🔴极强"
+                        elif score >= 75:
+                            level = "🟠强"
+                        elif score >= 60:
+                            level = "🟡关注"
+                        else:
+                            level = "⚪普通"
+
+                        # ===== 买入提示 =====
+                        buy_signal = ""
+                        if absorb and pump and confirm and side == "BID":
+                            buy_signal = "🟢买入信号"
+
+                        # ===== 消息 =====
                         msg = (
                             f"{symbol}/USDT\n"
+                            f"{level} {buy_signal}\n"
                             f"{side_str}\n"
                             f"💰 {format_usd(usd)}\n"
                             f"📍 {format_price(price_usdt)}\n"
-                            f"{absorb_signal} {pump_signal}\n"
-                            f"{confirm} {premium}\n"
+                            f"📊评分: {score}\n"
+                            f"溢价: {premium:.2f}%\n"
                             f"⏰ {time_str}"
                         )
 
