@@ -1,6 +1,9 @@
+import websocket
+import json
 import requests
 import time
 import datetime
+import threading
 import logging
 
 # ================== 配置 ==================
@@ -12,9 +15,11 @@ STRONG_USD = 120000
 
 EXCLUDE = ["BTC", "ETH", "USDT"]
 
+# ================== 状态 ==================
 seen = set()
 buy_flow = {}
 last_price = {}
+binance_cache = {}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -36,19 +41,31 @@ def format_usd(x):
         return f"${x/1_000:.0f}K"
     return f"${x:.0f}"
 
+# ================== Binance缓存价格 ==================
 def get_binance_price(symbol):
+    now = time.time()
+
+    if symbol in binance_cache:
+        price, ts = binance_cache[symbol]
+        if now - ts < 5:
+            return price
+
     try:
         r = requests.get(
             f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT",
             timeout=3
         ).json()
+
         if "price" in r:
-            return float(r["price"])
+            price = float(r["price"])
+            binance_cache[symbol] = (price, now)
+            return price
     except:
         pass
+
     return None
 
-# ================== 市场 ==================
+# ================== 获取市场 ==================
 def get_top_markets():
     res = requests.get("https://api.upbit.com/v1/market/all").json()
     krw = [
@@ -66,98 +83,123 @@ def get_top_markets():
 
     return [m["market"] for m in sorted_m[:30]]
 
-def get_trades(market):
+# ================== 信号处理 ==================
+def handle_trade(data):
     try:
-        return requests.get(
-            "https://api.upbit.com/v1/trades/ticks",
-            params={"market": market, "count": 10},
-            timeout=5
-        ).json()
-    except:
-        return []
+        symbol = data["cd"].replace("KRW-", "")
+        price = data["tp"]
+        volume = data["tv"]
+        side = data["ab"]  # BID / ASK
 
-# ================== 主逻辑 ==================
-def run():
-    send("🚀 实盘信号系统启动")
+        tid = f"{symbol}-{data['tms']}"
+        if tid in seen:
+            return
+        seen.add(tid)
+
+        # ===== Binance价格 =====
+        binance_price = get_binance_price(symbol)
+        if not binance_price:
+            return
+
+        usd = volume * binance_price
+        if usd < MIN_USD:
+            return
+
+        # ===== 吸筹 =====
+        buy_flow[symbol] = buy_flow.get(symbol, 0)
+        if side == "BID":
+            buy_flow[symbol] += 1
+        else:
+            buy_flow[symbol] = 0
+
+        absorb = buy_flow[symbol] >= 2
+
+        # ===== 拉盘 =====
+        pump = False
+        if symbol in last_price:
+            if (price - last_price[symbol]) / last_price[symbol] > 0.006:
+                pump = True
+
+        last_price[symbol] = price
+
+        # ===== 信号 =====
+        if usd > STRONG_USD and absorb and pump:
+            level = "🔴机会（可进场）"
+        elif absorb and usd > STRONG_USD:
+            level = "🟡吸筹"
+        elif pump:
+            level = "🟢拉升"
+        else:
+            return
+
+        side_str = "🟢买单" if side == "BID" else "🔴卖单"
+
+        dt = datetime.datetime.utcfromtimestamp(data["tms"]/1000) + datetime.timedelta(hours=8)
+
+        msg = (
+            f"{symbol}/USDT\n"
+            f"{level}\n"
+            f"{side_str}\n"
+            f"💰 {format_usd(usd)}\n"
+            f"📍 {binance_price:.4f}\n"
+            f"⏰ {dt.strftime('%H:%M:%S')}"
+        )
+
+        print(msg)
+        send(msg)
+
+    except Exception as e:
+        logging.error(e)
+
+# ================== WebSocket ==================
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        handle_trade(data)
+    except:
+        pass
+
+def on_error(ws, error):
+    logging.error(f"WS错误: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    logging.warning("WS断开，准备重连...")
+
+def on_open(ws):
+    logging.info("WebSocket已连接")
 
     markets = get_top_markets()
 
+    sub = [
+        {"ticket": "test"},
+        {
+            "type": "trade",
+            "codes": markets,
+            "isOnlyRealtime": True
+        }
+    ]
+
+    ws.send(json.dumps(sub))
+
+# ================== 启动 ==================
+def run_ws():
     while True:
-        for market in markets:
-            trades = get_trades(market)
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://api.upbit.com/websocket/v1",
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
 
-            for t in trades:
-                try:
-                    tid = t["sequential_id"]
-                    if tid in seen:
-                        continue
-                    seen.add(tid)
+            ws.on_open = on_open
+            ws.run_forever(ping_interval=30)
 
-                    price = t["trade_price"]
-                    volume = t["trade_volume"]
-                    side = t["ask_bid"]
+        except Exception as e:
+            logging.error(f"WS重启: {e}")
+            time.sleep(5)
 
-                    symbol = market.replace("KRW-", "")
-
-                    # ===== Binance价格 =====
-                    binance_price = get_binance_price(symbol)
-                    if not binance_price:
-                        continue
-
-                    usd = volume * binance_price
-
-                    if usd < MIN_USD:
-                        continue
-
-                    # ===== 吸筹 =====
-                    buy_flow[symbol] = buy_flow.get(symbol, 0)
-                    if side == "BID":
-                        buy_flow[symbol] += 1
-                    else:
-                        buy_flow[symbol] = 0
-
-                    absorb = buy_flow[symbol] >= 2
-
-                    # ===== 拉盘 =====
-                    pump = False
-                    if symbol in last_price:
-                        change = (price - last_price[symbol]) / last_price[symbol]
-                        if change > 0.006:
-                            pump = True
-
-                    last_price[symbol] = price
-
-                    # ===== 信号分级 =====
-                    level = ""
-                    if usd > STRONG_USD and absorb and pump:
-                        level = "🔴机会（可考虑进场）"
-                    elif absorb and usd > STRONG_USD:
-                        level = "🟡强势（主力吸筹）"
-                    elif pump:
-                        level = "🟢可做（资金推动）"
-                    else:
-                        continue
-
-                    side_str = "🟢买单" if side == "BID" else "🔴卖单"
-
-                    ts = t["timestamp"] / 1000
-                    dt = datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=8)
-
-                    msg = (
-                        f"{symbol}/USDT\n"
-                        f"{level}\n"
-                        f"{side_str}\n"
-                        f"💰 {format_usd(usd)}\n"
-                        f"📍 {binance_price:.4f}\n"
-                        f"⏰ {dt.strftime('%H:%M:%S')}"
-                    )
-
-                    send(msg)
-
-                except Exception as e:
-                    logging.error(e)
-
-            time.sleep(0.2)
-
+# ================== 主入口 ==================
 if __name__ == "__main__":
-    run()
+    send("🚀 WebSocket 实盘系统启动")
+    run_ws()
