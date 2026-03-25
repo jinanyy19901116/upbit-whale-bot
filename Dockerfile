@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y \
     curl gnupg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ================= 安装 Chrome（新方式） =================
+# ================= 安装 Chrome =================
 RUN mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
     | gpg --dearmor -o /etc/apt/keyrings/google.gpg \
@@ -16,8 +16,12 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
-# ================= 安装 ChromeDriver（固定稳定版） =================
-RUN wget https://chromedriver.storage.googleapis.com/114.0.5735.90/chromedriver_linux64.zip \
+# ================= 自动匹配 ChromeDriver =================
+RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
+    && echo "Chrome version: $CHROME_VERSION" \
+    && DRIVER_VERSION=$(curl -s "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_$CHROME_VERSION") \
+    && echo "Driver version: $DRIVER_VERSION" \
+    && wget https://chromedriver.storage.googleapis.com/$DRIVER_VERSION/chromedriver_linux64.zip \
     && unzip chromedriver_linux64.zip -d /usr/local/bin/ \
     && rm chromedriver_linux64.zip \
     && chmod +x /usr/local/bin/chromedriver
