@@ -9,8 +9,8 @@ TELEGRAM_CHAT_ID = 5671949305
 ARKHAM_API_KEY = "19d2a233-8eaa-49be-bb02-403a8e636f9b"
 
 # ==================== 参数 ====================
-BIG_MONEY = 200_000  # 20万美元
-CHECK_INTERVAL = 20
+BIG_MONEY = 200_000  # 20万美元大单
+CHECK_INTERVAL = 20   # Arkham接口轮询间隔（秒）
 EXCLUDE_COINS = ["BTC", "ETH", "XRP", "SOL", "ADA", "DOGE"]
 KOREA_EXCHANGES = ["upbit", "bithumb", "coinone", "korbit"]
 
@@ -34,7 +34,11 @@ def arkham_monitor():
 
     while True:
         try:
-            url = "https://api.arkhamintelligence.com/transfers"
+            now = int(time.time())
+            start = now - CHECK_INTERVAL  # 查询最近 CHECK_INTERVAL 秒
+            end = now
+
+            url = f"https://api.arkhamintelligence.com/transfers?startTime={start}&endTime={end}"
             headers = {"Authorization": f"Bearer {ARKHAM_API_KEY}"}
 
             try:
@@ -123,7 +127,7 @@ def arkham_monitor():
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    tg("🚀 启动（Arkham稳定生产版）")
+    tg("🚀 启动（Arkham稳定生产版 + 时间戳修复）")
     threading.Thread(target=arkham_monitor, daemon=True).start()
 
     while True:
