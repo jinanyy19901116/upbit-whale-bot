@@ -16,16 +16,6 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
-# ================= 自动匹配 ChromeDriver =================
-RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
-    && echo "Chrome version: $CHROME_VERSION" \
-    && DRIVER_VERSION=$(curl -s "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_$CHROME_VERSION") \
-    && echo "Driver version: $DRIVER_VERSION" \
-    && wget https://chromedriver.storage.googleapis.com/$DRIVER_VERSION/chromedriver_linux64.zip \
-    && unzip chromedriver_linux64.zip -d /usr/local/bin/ \
-    && rm chromedriver_linux64.zip \
-    && chmod +x /usr/local/bin/chromedriver
-
 # ================= Python依赖 =================
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip
