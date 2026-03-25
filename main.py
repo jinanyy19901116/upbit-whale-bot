@@ -25,6 +25,28 @@ logging.basicConfig(level=logging.INFO,
 
 logging.info("程序启动")
 
+# ------------------- 汇率 -------------------
+def get_krw_usd():
+    try:
+        r = requests.get("https://api.exchangerate.host/latest?base=KRW&symbols=USD", timeout=5)
+        return r.json()["rates"]["USD"]
+    except:
+        return 0.00075
+
+KRW_TO_USD = get_krw_usd()
+last_rate_update = time.time()
+
+def to_usd(krw):
+    return krw * KRW_TO_USD
+
+def format_usd(x):
+    if x >= 1_000_000:
+        return f"${x/1_000_000:.2f}M"
+    elif x >= 1_000:
+        return f"${x/1_000:.1f}K"
+    else:
+        return f"${x:.0f}"
+
 # ------------------- 时间 -------------------
 def bj_time(ts):
     utc = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
@@ -35,22 +57,22 @@ def bj_time(ts):
 def tg(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
     except:
         pass
 
-tg("✅ 监控系统已启动（无买卖比版）")
+tg("✅ 监控系统启动（带买卖信号）")
 
 # ------------------- 获取Top30 -------------------
 def get_top30():
     try:
-        all_m = requests.get("https://api.upbit.com/v1/market/all").json()
+        all_m = requests.get("https://api.upbit.com/v1/market/all", timeout=5).json()
         krw = [m["market"] for m in all_m if m["market"].startswith("KRW-") and m["market"] not in ["KRW-BTC","KRW-ETH"]]
 
         result = []
         for m in krw:
             try:
-                data = requests.get(f"https://api.upbit.com/v1/ticker?markets={m}").json()
+                data = requests.get(f"https://api.upbit.com/v1/ticker?markets={m}", timeout=5).json()
                 vol = data[0]["acc_trade_price_24h"]
                 result.append((m, vol))
                 time.sleep(0.05)
@@ -70,12 +92,22 @@ burst_data = defaultdict(lambda: deque())
 acc_data = defaultdict(lambda: deque())
 price_cache = defaultdict(lambda: deque())
 
+# 👉 新增：信号状态记忆
+signal_state = defaultdict(lambda: {"acc": False, "burst": False})
+
 # ------------------- 主循环 -------------------
 while True:
     try:
+        if time.time() - last_rate_update > 600:
+            KRW_TO_USD = get_krw_usd()
+            last_rate_update = time.time()
+
         for market in MARKETS:
             try:
-                r = requests.get(f"https://api.upbit.com/v1/trades/ticks?market={market}&count=10")
+                r = requests.get(
+                    f"https://api.upbit.com/v1/trades/ticks?market={market}&count=10",
+                    timeout=5
+                )
 
                 if r.status_code != 200:
                     continue
@@ -101,14 +133,14 @@ while True:
                         continue
 
                     amount = price * vol
+                    usd = to_usd(amount)
+
                     now = time.time()
                     time_str = bj_time(ts)
 
                     # ------------------- 大单 -------------------
                     if amount >= BIG_TRADE:
-                        msg = f"💰大单 {market} {time_str} {amount:,.0f}"
-                        logging.info(msg)
-                        tg(msg)
+                        tg(f"💰大单 {market} {time_str} {format_usd(usd)}")
 
                     # ------------------- 拉盘 -------------------
                     if side == "BID":
@@ -120,9 +152,8 @@ while True:
                         total = sum(x[1] for x in burst_data[market])
 
                         if total >= BURST:
-                            msg = f"🚀拉盘 {market} {time_str} {total:,.0f}"
-                            logging.warning(msg)
-                            tg(msg)
+                            signal_state[market]["burst"] = True
+                            tg(f"🚀拉盘 {market} {time_str} {format_usd(to_usd(total))}")
                             burst_data[market].clear()
 
                     # ------------------- 吸筹 -------------------
@@ -135,9 +166,8 @@ while True:
                         acc_total = sum(x[1] for x in acc_data[market])
 
                         if acc_total >= ACCUMULATION:
-                            msg = f"🟢吸筹 {market} {time_str} {acc_total:,.0f}"
-                            logging.info(msg)
-                            tg(msg)
+                            signal_state[market]["acc"] = True
+                            tg(f"🟢吸筹 {market} {time_str} {format_usd(to_usd(acc_total))}")
                             acc_data[market].clear()
 
                     # ------------------- 价格联动 -------------------
@@ -150,20 +180,31 @@ while True:
                         old_price = price_cache[market][0][1]
                         change = (price - old_price) / old_price
 
+                        # 🟢 买入信号
                         if change > 0.01:
                             tg(f"⚡上涨 {market} +{change*100:.2f}%")
+
+                            if signal_state[market]["acc"] and signal_state[market]["burst"]:
+                                tg(f"🟢【买入信号】{market} 🚀主力启动")
+                                signal_state[market] = {"acc": False, "burst": False}
+
+                        # 🔴 卖出信号
                         elif change < -0.01:
                             tg(f"⚡下跌 {market} {change*100:.2f}%")
+
+                            if signal_state[market]["acc"] or signal_state[market]["burst"]:
+                                tg(f"🔴【卖出信号】{market} ⚠️主力可能出货")
+                                signal_state[market] = {"acc": False, "burst": False}
 
                     last_ts[market] = ts
 
                 time.sleep(REQUEST_INTERVAL)
 
             except Exception as e:
-                logging.error(f"{market}错误 {e}")
+                logging.error(f"{market}错误: {e}")
 
         time.sleep(LOOP_INTERVAL)
 
     except Exception as e:
-        logging.error(f"主循环错误 {e}")
+        logging.error(f"主循环错误: {e}")
         time.sleep(2)
