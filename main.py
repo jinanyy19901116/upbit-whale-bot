@@ -39,7 +39,7 @@ def tg(msg):
     except:
         pass
 
-tg("✅ 交易级监控系统启动")
+tg("✅ 监控系统已启动（无买卖比版）")
 
 # ------------------- 获取Top30 -------------------
 def get_top30():
@@ -68,8 +68,6 @@ last_ts = {m: 0 for m in MARKETS}
 
 burst_data = defaultdict(lambda: deque())
 acc_data = defaultdict(lambda: deque())
-trade_flow = defaultdict(lambda: deque())
-
 price_cache = defaultdict(lambda: deque())
 
 # ------------------- 主循环 -------------------
@@ -141,23 +139,6 @@ while True:
                             logging.info(msg)
                             tg(msg)
                             acc_data[market].clear()
-
-                    # ------------------- 买卖比 -------------------
-                    trade_flow[market].append((now, amount, side))
-
-                    while trade_flow[market] and now - trade_flow[market][0][0] > ACC_WINDOW:
-                        trade_flow[market].popleft()
-
-                    buy = sum(x[1] for x in trade_flow[market] if x[2] == "BID")
-                    sell = sum(x[1] for x in trade_flow[market] if x[2] == "ASK")
-
-                    if buy + sell > 0:
-                        ratio = buy / (buy + sell)
-
-                        if ratio > 0.7:
-                            tg(f"📊强买 {market} 买占比 {ratio:.2f}")
-                        elif ratio < 0.3:
-                            tg(f"📊强卖 {market} 卖占比 {1-ratio:.2f}")
 
                     # ------------------- 价格联动 -------------------
                     price_cache[market].append((now, price))
