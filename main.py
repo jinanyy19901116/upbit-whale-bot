@@ -2,136 +2,154 @@ import json
 import time
 import threading
 import requests
+import os
 from datetime import datetime, timezone, timedelta
 import websocket
+from collections import defaultdict
 
-# ==================== 配置 ====================
-TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
+# ==================== Telegram ====================
+TELEGRAM_TOKEN =  "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = 5671949305
 
-# ==================== 监控合约列表（Binance 永续 + Upbit 热门币对应） ====================
-SYMBOLS = [
-    # 主流高流动性合约
-    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT", "SUIUSDT",
-    "TRXUSDT", "SHIBUSDT",  "LTCUSDT", "BCHUSDT",
-    "MATICUSDT", "HBARUSDT", "VETUSDT", "XLMUSDT",
-    "SIGNUSDT", "KITEUSDT", "ZETAUSDT", "ATHUSDT",
-    "CPOOLUSDT", "IPUSDT", "AKTUSDT", "SAHARAUSDT", "SUNUSDT"
-]
+# ==================== 参数 ====================
+BIG_TRADE = 300_000_000
+SUPER_BIG = 800_000_000
 
-# 阈值设置（USDT）
-BIG_TRADE_THRESHOLD = 100000      # 大单阈值：10万美元（可调低测试）
-LIQUIDATION_THRESHOLD = 100000    # 爆仓阈值：10万美元
+WINDOW = 10
+MIN_COUNT = 3
 
-# 北京时间
+BREAK_WINDOW = 30   # 价格突破窗口
+PUMP_WINDOW = 10
+PUMP_COUNT = 4
+
+# ==================== 时间 ====================
 BEIJING_TZ = timezone(timedelta(hours=8))
+def now(): return datetime.now(BEIJING_TZ)
 
-def beijing_time():
-    return datetime.now(BEIJING_TZ)
-
-def send_telegram(msg: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+# ==================== 获取交易对 ====================
+def get_symbols():
     try:
-        requests.post(url, json=payload, timeout=10)
-        print("[Telegram] 已推送")
-    except Exception as e:
-        print(f"[Telegram 失败]: {e}")
+        r = requests.get("https://api.upbit.com/v1/market/all").json()
+        return [x["market"] for x in r if x["market"].startswith("KRW-")]
+    except:
+        return ["KRW-BTC","KRW-ETH"]
 
-# ==================== WebSocket 回调 ====================
-def on_open(ws):
-    print(f"[{beijing_time().strftime('%H:%M:%S')}] Binance Futures WebSocket 已连接（北京时间）")
-    
-    streams = [f"{s.lower()}@forceOrder" for s in SYMBOLS]
-    streams.append("!forceOrder@arr")                    # 全市场爆仓
-    streams.extend([f"{s.lower()}@aggTrade" for s in SYMBOLS])  # 大单
-    
-    payload = {"method": "SUBSCRIBE", "params": streams, "id": 1}
-    ws.send(json.dumps(payload))
-    print(f"已订阅 {len(SYMBOLS)} 个合约的爆仓 + 大单流")
+SYMBOLS = get_symbols()
 
-def on_message(ws, message):
+# ==================== Telegram ====================
+def tg(msg):
     try:
-        data = json.loads(message)
-        
-        # === 爆仓处理 ===
-        if data.get("e") == "forceOrder" or (isinstance(data, list) and data and data[0].get("e") == "forceOrder"):
-            order = data if isinstance(data, dict) else data[0]
-            qty = float(order.get("q", 0))
-            price = float(order.get("p", 0))
-            amount = qty * price
-            symbol = order.get("s", "UNKNOWN")
-            
-            if amount >= LIQUIDATION_THRESHOLD:
-                side = "多单爆仓" if order.get("S") == "SELL" else "空单爆仓"
-                msg = f"""
-<b>💥 Binance 爆仓警报！</b>
-{symbol} {side}
-金额：${amount:,.0f} USDT
-价格：{price:,.4f}
-北京时间：{beijing_time().strftime('%H:%M:%S')}
-🔗 https://www.binance.com/en/futures/{symbol}
-                """.strip()
-                print(f"[{beijing_time().strftime('%H:%M:%S')}] 爆仓 → {symbol} ${amount:,.0f}")
-                send_telegram(msg)
-        
-        # === 大单处理 ===
-        elif data.get("e") == "aggTrade":
-            symbol = data.get("s")
-            qty = float(data.get("q", 0))
-            price = float(data.get("p", 0))
-            amount = qty * price
-            is_buyer_maker = data.get("m", False)
-            
-            if amount >= BIG_TRADE_THRESHOLD:
-                direction = "大额买入" if not is_buyer_maker else "大额卖出"
-                msg = f"""
-<b>🚨 Binance 大单警报！</b>
-{symbol} {direction}
-金额：${amount:,.0f} USDT
-数量：{qty:,.2f}
-价格：{price:,.4f}
-北京时间：{beijing_time().strftime('%H:%M:%S')}
-                """.strip()
-                print(f"[{beijing_time().strftime('%H:%M:%S')}] 大单 → {symbol} ${amount:,.0f}")
-                send_telegram(msg)
-                
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
     except:
         pass
 
-def on_error(ws, error):
-    print("WebSocket 错误:", error)
+# ==================== 缓存 ====================
+trade_cache = defaultdict(list)
+price_cache = defaultdict(list)
+
+# ==================== WS ====================
+def on_open(ws):
+    for i in range(0, len(SYMBOLS), 30):
+        ws.send(json.dumps([
+            {"ticket": "x"},
+            {"type": "trade", "codes": SYMBOLS[i:i+30]}
+        ]))
+        time.sleep(0.2)
+
+def on_message(ws, message):
+    try:
+        d = json.loads(message)
+
+        price = d.get("trade_price", 0)
+        vol = d.get("trade_volume", 0)
+        symbol = d.get("code", "")
+        amount = price * vol
+        side = "BUY" if d.get("ask_bid") == "BID" else "SELL"
+        t = time.time()
+
+        # ==================== 价格缓存 ====================
+        price_cache[symbol].append((t, price))
+        price_cache[symbol] = [(ts, p) for ts, p in price_cache[symbol] if t - ts <= BREAK_WINDOW]
+
+        recent_prices = [p for ts, p in price_cache[symbol]]
+        max_price = max(recent_prices) if recent_prices else price
+
+        # ==================== 大单标签 ====================
+        tag = ""
+        if amount >= SUPER_BIG:
+            tag = "⚠️ 巨鲸"
+        elif amount >= BIG_TRADE:
+            tag = "🐳 主力"
+
+        # ==================== 大单 ====================
+        if amount >= BIG_TRADE:
+            tg(f"🚨 大单 {symbol}\n{tag} {side}\n₩{amount:,.0f}")
+
+        # ==================== 缓存 ====================
+        trade_cache[symbol].append({"t": t, "side": side, "amount": amount, "price": price})
+        trade_cache[symbol] = [x for x in trade_cache[symbol] if t - x["t"] <= WINDOW]
+
+        same = [x for x in trade_cache[symbol] if x["side"] == side and x["amount"] >= BIG_TRADE]
+
+        # ==================== 连续大单 ====================
+        if len(same) >= MIN_COUNT:
+            total = sum(x["amount"] for x in same)
+            tg(f"🔥 连续大单 {symbol}\n{side}\n{len(same)}次 ₩{total:,.0f}")
+            trade_cache[symbol].clear()
+            return
+
+        # ==================== 🚀 价格突破 + 大单 ====================
+        if price >= max_price and amount >= BIG_TRADE and side == "BUY":
+            tg(f"""
+🚀 <b>突破 + 大单确认</b>
+{symbol}
+价格突破 + 主力买入
+₩{amount:,.0f}
+""")
+            trade_cache[symbol].clear()
+            return
+
+        # ==================== 🔥 妖币启动 ====================
+        pump = [x for x in trade_cache[symbol] if t - x["t"] <= PUMP_WINDOW and x["side"] == "BUY"]
+
+        if len(pump) >= PUMP_COUNT:
+            total = sum(x["amount"] for x in pump)
+            prices = [x["price"] for x in pump]
+
+            if max(prices) > min(prices):  # 有上涨
+                tg(f"""
+🔥 <b>妖币启动</b>
+{symbol}
+连续拉升 {len(pump)}次
+₩{total:,.0f}
+⚡ 高概率主力拉盘
+""")
+                trade_cache[symbol].clear()
+
+    except:
+        pass
 
 def on_close(ws, *args):
-    print(f"[{beijing_time().strftime('%H:%M:%S')}] WebSocket 关闭 → 5秒后重连")
     time.sleep(5)
-    start_ws()
+    start()
 
-def start_ws():
+def start():
     ws = websocket.WebSocketApp(
-        "wss://fstream.binance.com/ws",
+        "wss://api.upbit.com/websocket/v1",
         on_open=on_open,
         on_message=on_message,
-        on_error=on_error,
         on_close=on_close
     )
-    ws.run_forever(ping_interval=30, ping_timeout=10)
+    ws.run_forever()
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    bt = beijing_time()
-    print(f"Binance Futures 监控机器人启动成功！（北京时间 {bt.strftime('%Y-%m-%d %H:%M:%S')}）")
-    print(f"监控合约数量: {len(SYMBOLS)} 个")
-    print(f"大单阈值: ${BIG_TRADE_THRESHOLD:,} USDT")
-    print(f"爆仓阈值: ${LIQUIDATION_THRESHOLD:,} USDT")
-    
-    start_msg = f"<b>🚀 Binance Futures 监控已启动</b>\n北京时间：{bt.strftime('%Y-%m-%d %H:%M:%S')}\n监控合约：{len(SYMBOLS)} 个\n大单阈值：${BIG_TRADE_THRESHOLD:,} USDT\n爆仓阈值：${LIQUIDATION_THRESHOLD:,} USDT"
-    send_telegram(start_msg)
-    
-    threading.Thread(target=start_ws, daemon=True).start()
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("程序已停止")
+    tg("🚀 启动（突破+妖币识别版）")
+    threading.Thread(target=start, daemon=True).start()
+
+    while True:
+        time.sleep(1)
