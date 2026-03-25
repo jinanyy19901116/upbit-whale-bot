@@ -96,12 +96,14 @@ def on_trade(msg):
         logging.info(message)
         send_telegram(message)
 
-# ------------------- 启动 WebSocket -------------------
-ws = WebSocketClient(markets=MARKETS, type="trade", on_message=on_trade)
-
+# ------------------- 启动 WebSocket（最新版 pyupbit） -------------------
 if __name__ == "__main__":
     try:
-        ws.run()
+        WebSocketClient.run_websocket_client(
+            markets=MARKETS,
+            type="trade",
+            callback=on_trade
+        )
     except KeyboardInterrupt:
         logging.info("程序手动停止")
     except Exception as e:
