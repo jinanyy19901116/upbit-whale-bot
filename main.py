@@ -9,17 +9,39 @@ TELEGRAM_CHAT_ID = "5671949305"
 
 MIN_USD = 200000
 NEW_COIN_USD = 100000
-KRW_TO_USD = 0.00075
 
 EXCLUDE = ["BTC", "ETH", "USDT"]
+
+# ================== 汇率 ==================
+krw_to_usdt_rate = 0.00075  # 初始备用
+
+def update_fx_rate():
+    global krw_to_usdt_rate
+    try:
+        btc_usdt = float(requests.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+            timeout=3
+        ).json()["price"])
+
+        btc_krw = float(requests.get(
+            "https://api.upbit.com/v1/ticker",
+            params={"markets": "KRW-BTC"},
+            timeout=3
+        ).json()[0]["trade_price"])
+
+        krw_to_usdt_rate = btc_usdt / btc_krw
+
+    except Exception as e:
+        logging.error(f"汇率更新失败: {e}")
+
+def price_to_usdt(price_krw):
+    return price_krw * krw_to_usdt_rate
 
 # ================== 状态 ==================
 known_markets = set()
 new_coin_watchlist = {}
-
 trade_history = {}
 seen = set()
-
 buy_flow = {}
 last_price = {}
 
@@ -46,13 +68,10 @@ def format_usd(x):
 
 def format_price(x):
     if x >= 1:
-        return f"{x:.2f}"
-    elif x >= 0.01:
         return f"{x:.4f}"
-    return f"{x:.6f}"
-
-def price_to_usdt(p):
-    return p * KRW_TO_USD
+    elif x >= 0.01:
+        return f"{x:.6f}"
+    return f"{x:.8f}"
 
 # ================== 机器人过滤 ==================
 def is_bot_trade(symbol, usd, side):
@@ -64,10 +83,7 @@ def is_bot_trade(symbol, usd, side):
 
     amounts = [round(x[0], -3) for x in trade_history[symbol]]
 
-    if amounts.count(amounts[-1]) >= 3:
-        return True
-
-    return False
+    return amounts.count(amounts[-1]) >= 3
 
 def is_arbitrage(symbol):
     if symbol not in trade_history:
@@ -81,7 +97,7 @@ def is_arbitrage(symbol):
 def is_fake_pump(absorb, pump, confirm):
     return absorb and pump and not confirm
 
-# ================== 新币检测 ==================
+# ================== 新币 ==================
 def check_new_listings():
     global known_markets, new_coin_watchlist
 
@@ -102,8 +118,7 @@ def check_new_listings():
 
             new_coin_watchlist[symbol] = time.time()
 
-            msg = f"🆕 新币上线\n{symbol}/USDT\n🔥 重点观察30分钟"
-            send_telegram(msg)
+            send_telegram(f"🆕 新币上线\n{symbol}/USDT")
 
         known_markets = current
 
@@ -120,7 +135,10 @@ def get_top_markets():
         and not any(x in m["market"] for x in EXCLUDE)
     ]
 
-    tickers = requests.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(krw)}).json()
+    tickers = requests.get(
+        "https://api.upbit.com/v1/ticker",
+        params={"markets": ",".join(krw)}
+    ).json()
 
     sorted_m = sorted(tickers, key=lambda x: x["acc_trade_price_24h"], reverse=True)
 
@@ -147,13 +165,20 @@ def get_binance_price(symbol):
 
 # ================== 主逻辑 ==================
 def run():
-    logging.info("终极系统启动")
+    logging.info("系统启动")
     send_telegram("🚀 系统启动成功")
 
     markets = get_top_markets()
 
+    last_fx_update = 0
+
     while True:
         try:
+            # ===== 汇率更新（30秒）=====
+            if time.time() - last_fx_update > 30:
+                update_fx_rate()
+                last_fx_update = time.time()
+
             check_new_listings()
 
             for market in markets:
@@ -171,9 +196,8 @@ def run():
                         side = t["ask_bid"]
 
                         symbol = market.replace("KRW-", "")
-                        usd = price * volume * KRW_TO_USD
+                        usd = price * volume * krw_to_usdt_rate
 
-                        # ===== 新币阈值 =====
                         threshold = MIN_USD
                         if symbol in new_coin_watchlist:
                             if time.time() - new_coin_watchlist[symbol] < 1800:
@@ -182,19 +206,22 @@ def run():
                         if usd < threshold:
                             continue
 
-                        # ===== 机器人过滤 =====
                         if is_bot_trade(symbol, usd, side):
                             continue
 
                         if is_arbitrage(symbol):
                             continue
 
-                        price_usdt = price_to_usdt(price)
+                        # ===== 核心：价格校准 =====
+                        binance_price = get_binance_price(symbol)
 
-                        # ===== 买卖 =====
+                        if binance_price:
+                            price_usdt = binance_price
+                        else:
+                            price_usdt = price_to_usdt(price)
+
                         side_str = "🟢买单" if side == "BID" else "🔴卖单"
 
-                        # ===== 时间 =====
                         ts = t["timestamp"] / 1000
                         dt = datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=8)
                         time_str = dt.strftime("%H:%M:%S")
@@ -211,59 +238,33 @@ def run():
                         # ===== 拉盘 =====
                         pump = False
                         if symbol in last_price:
-                            change = (price - last_price[symbol]) / last_price[symbol]
-                            if change > 0.01:
+                            if (price - last_price[symbol]) / last_price[symbol] > 0.01:
                                 pump = True
 
                         last_price[symbol] = price
 
-                        # ===== Binance =====
-                        binance_price = get_binance_price(symbol)
-                        confirm = False
-                        premium = 0
+                        confirm = binance_price is not None
 
-                        if binance_price:
-                            diff = (price_usdt - binance_price) / binance_price
-                            premium = diff * 100
-                            confirm = abs(diff) < 1
-
-                        # ===== 假拉盘过滤 =====
                         if is_fake_pump(absorb, pump, confirm):
                             continue
 
-                        # ===== 评分 =====
                         score = 0
                         if usd > 300000: score += 20
                         elif usd > 200000: score += 10
                         if absorb: score += 25
                         if pump: score += 25
                         if confirm: score += 20
-                        if premium > 2: score += 10
 
-                        # ===== 等级 =====
-                        if score >= 90:
-                            level = "🔴极强"
-                        elif score >= 75:
-                            level = "🟠强"
-                        elif score >= 60:
-                            level = "🟡关注"
-                        else:
-                            level = "⚪普通"
+                        level = "🔴极强" if score >= 90 else "🟠强" if score >= 75 else "🟡关注"
 
-                        # ===== 买点 =====
-                        buy_signal = ""
-                        if absorb and pump and confirm and side == "BID":
-                            buy_signal = "🟢买入信号"
+                        buy_signal = "🟢买入信号" if absorb and pump and confirm and side == "BID" else ""
 
-                        # ===== 消息 =====
                         msg = (
                             f"{symbol}/USDT\n"
                             f"{level} {buy_signal}\n"
                             f"{side_str}\n"
                             f"💰 {format_usd(usd)}\n"
                             f"📍 {format_price(price_usdt)}\n"
-                            f"📊评分: {score}\n"
-                            f"溢价: {premium:.2f}%\n"
                             f"⏰ {time_str}"
                         )
 
