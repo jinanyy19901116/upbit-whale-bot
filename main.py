@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =========================
-# 🔑 Telegram 配置
+# Telegram 配置
 # =========================
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
@@ -15,17 +15,17 @@ TELEGRAM_CHAT_ID = "5671949305"
 # =========================
 # 参数配置
 # =========================
-MIN_USD = 20000        # 最低提醒金额
-BIG_USD = 200000       # 大单
-ACCUM_USD = 300000     # 吸筹累计阈值
-EXCHANGE_RATE = 1300   # KRW -> USD兜底
+MIN_USD = 20000
+BIG_USD = 200000
+ACCUM_USD = 300000
+EXCHANGE_RATE = 1300
 
-BLACKLIST = ["BTC", "ETH", "USDT"]  # 屏蔽交易对
+BLACKLIST = ["BTC", "ETH", "USDT"]
 
 markets = []
 known_markets = set()
 accum_data = {}
-price_usd = {}  # CoinGecko 价格缓存
+price_usd = {}
 
 # =========================
 # 工具函数
@@ -87,21 +87,26 @@ def check_new_listing():
         logging.error(f"新币检测失败: {e}")
 
 # =========================
-# CoinGecko 价格更新
+# CoinGecko 价格更新（限速保护版）
 # =========================
 def update_price():
     global price_usd
     while True:
         try:
             url = "https://api.coingecko.com/api/v3/coins/markets"
-            params = {"vs_currency": "usd", "order":"market_cap_desc", "per_page":250, "page":1}
-            res = requests.get(url, params=params, timeout=10).json()
-            if not isinstance(res, list):
-                logging.error(f"价格返回异常: {res}")
-                time.sleep(10)
+            params = {"vs_currency":"usd","order":"market_cap_desc","per_page":250,"page":1}
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 429:
+                logging.warning("CoinGecko 限速，使用 KRW兜底")
+                time.sleep(60)
+                continue
+            data = res.json()
+            if not isinstance(data, list):
+                logging.warning(f"价格返回异常: {data}")
+                time.sleep(60)
                 continue
             temp = {}
-            for coin in res:
+            for coin in data:
                 symbol = coin.get("symbol", "").upper()
                 p = coin.get("current_price")
                 if symbol and p:
@@ -109,7 +114,16 @@ def update_price():
             price_usd = temp
         except Exception as e:
             logging.error(f"价格更新失败: {e}")
-        time.sleep(20)
+        time.sleep(60)  # 每60秒更新一次，避免限速
+
+# =========================
+# Fallback价格
+# =========================
+def get_price_fallback(coin, price_krw):
+    try:
+        return price_krw / EXCHANGE_RATE
+    except:
+        return 0
 
 # =========================
 # 处理成交信号
@@ -128,13 +142,11 @@ def handle_trade(data):
         if volume == 0:
             return
 
-        # 优先 CoinGecko 价格
-        usd_price = price_usd.get(coin, price_krw / EXCHANGE_RATE)
+        usd_price = price_usd.get(coin, get_price_fallback(coin, price_krw))
         usd_total = usd_price * volume
         if usd_total < MIN_USD:
             return
 
-        # 吸筹累计
         now = time.time()
         acc = accum_data.get(coin, {"usd":0,"time":now})
         if now - acc["time"] < 60:
