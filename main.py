@@ -28,7 +28,10 @@ logging.info("程序启动")
 # ------------------- 汇率 -------------------
 def get_krw_usd():
     try:
-        r = requests.get("https://api.exchangerate.host/latest?base=KRW&symbols=USD", timeout=5)
+        r = requests.get(
+            "https://api.exchangerate.host/latest?base=KRW&symbols=USD",
+            timeout=5
+        )
         return r.json()["rates"]["USD"]
     except:
         return 0.00075
@@ -61,18 +64,25 @@ def tg(msg):
     except:
         pass
 
-tg("✅ 监控系统启动（带买卖信号）")
+tg("✅ 监控系统启动（多行格式版）")
 
 # ------------------- 获取Top30 -------------------
 def get_top30():
     try:
         all_m = requests.get("https://api.upbit.com/v1/market/all", timeout=5).json()
-        krw = [m["market"] for m in all_m if m["market"].startswith("KRW-") and m["market"] not in ["KRW-BTC","KRW-ETH"]]
+        krw = [
+            m["market"] for m in all_m
+            if m["market"].startswith("KRW-")
+            and m["market"] not in ["KRW-BTC", "KRW-ETH"]
+        ]
 
         result = []
         for m in krw:
             try:
-                data = requests.get(f"https://api.upbit.com/v1/ticker?markets={m}", timeout=5).json()
+                data = requests.get(
+                    f"https://api.upbit.com/v1/ticker?markets={m}",
+                    timeout=5
+                ).json()
                 vol = data[0]["acc_trade_price_24h"]
                 result.append((m, vol))
                 time.sleep(0.05)
@@ -86,21 +96,24 @@ def get_top30():
 
 # ------------------- 初始化 -------------------
 MARKETS = get_top30()
+logging.info(f"监控币种: {len(MARKETS)}")
+
 last_ts = {m: 0 for m in MARKETS}
 
 burst_data = defaultdict(lambda: deque())
 acc_data = defaultdict(lambda: deque())
 price_cache = defaultdict(lambda: deque())
 
-# 👉 新增：信号状态记忆
 signal_state = defaultdict(lambda: {"acc": False, "burst": False})
 
 # ------------------- 主循环 -------------------
 while True:
     try:
+        # 汇率更新
         if time.time() - last_rate_update > 600:
             KRW_TO_USD = get_krw_usd()
             last_rate_update = time.time()
+            logging.info(f"汇率更新: {KRW_TO_USD}")
 
         for market in MARKETS:
             try:
@@ -138,9 +151,20 @@ while True:
                     now = time.time()
                     time_str = bj_time(ts)
 
-                    # ------------------- 大单 -------------------
+                    # ------------------- 大单（多行格式）-------------------
                     if amount >= BIG_TRADE:
-                        tg(f"💰大单 {market} {time_str} {format_usd(usd)}")
+                        side_str = "🟢买单" if side == "BID" else "🔴卖单"
+
+                        msg = (
+                            f"{market}\n"
+                            f"{side_str}\n"
+                            f"💰 {format_usd(usd)}\n"
+                            f"📍 {price}\n"
+                            f"⏰ {time_str}"
+                        )
+
+                        logging.info(msg)
+                        tg(msg)
 
                     # ------------------- 拉盘 -------------------
                     if side == "BID":
@@ -153,7 +177,7 @@ while True:
 
                         if total >= BURST:
                             signal_state[market]["burst"] = True
-                            tg(f"🚀拉盘 {market} {time_str} {format_usd(to_usd(total))}")
+                            tg(f"🚀拉盘 {market} {format_usd(to_usd(total))}")
                             burst_data[market].clear()
 
                     # ------------------- 吸筹 -------------------
@@ -167,7 +191,7 @@ while True:
 
                         if acc_total >= ACCUMULATION:
                             signal_state[market]["acc"] = True
-                            tg(f"🟢吸筹 {market} {time_str} {format_usd(to_usd(acc_total))}")
+                            tg(f"🟢吸筹 {market} {format_usd(to_usd(acc_total))}")
                             acc_data[market].clear()
 
                     # ------------------- 价格联动 -------------------
@@ -180,7 +204,7 @@ while True:
                         old_price = price_cache[market][0][1]
                         change = (price - old_price) / old_price
 
-                        # 🟢 买入信号
+                        # 买入信号
                         if change > 0.01:
                             tg(f"⚡上涨 {market} +{change*100:.2f}%")
 
@@ -188,7 +212,7 @@ while True:
                                 tg(f"🟢【买入信号】{market} 🚀主力启动")
                                 signal_state[market] = {"acc": False, "burst": False}
 
-                        # 🔴 卖出信号
+                        # 卖出信号
                         elif change < -0.01:
                             tg(f"⚡下跌 {market} {change*100:.2f}%")
 
