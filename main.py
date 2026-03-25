@@ -8,21 +8,20 @@ TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
 # ------------------- 大单阈值 & 监控币种 -------------------
-# 20万美元≈27,000,000 KRW，可根据汇率调整
-BIG_TRADE_THRESHOLD = 27_000_000  
+BIG_TRADE_THRESHOLD = 27_000_000  # 约20万美元 KRW
 
-# 监控交易对（小币种，韩国人偏好）
+# 小币种列表
 MARKETS = [
-    "KRW-SIGN",   # Signum
-    "KRW-CHZ",    # Chiliz
-    "KRW-MANA",   # Decentraland
-    "KRW-SAND",   # Sandbox
-    "KRW-ENJ",    # Enjin Coin
-    "KRW-AAVE",   # Aave
-    "KRW-1INCH",  # 1inch
-    "KRW-CRV",    # Curve
-    "KRW-ANKR",   # Ankr
-    "KRW-LOOM",   # Loom Network
+    "KRW-SIGN",
+    "KRW-CHZ",
+    "KRW-MANA",
+    "KRW-SAND",
+    "KRW-ENJ",
+    "KRW-AAVE",
+    "KRW-1INCH",
+    "KRW-CRV",
+    "KRW-ANKR",
+    "KRW-LOOM",
 ]
 
 # ------------------- 日志设置 -------------------
@@ -35,11 +34,7 @@ logging.info("程序启动")
 # ------------------- Telegram 推送函数 -------------------
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         response = requests.post(url, data=data)
         if response.status_code == 200:
@@ -49,15 +44,11 @@ def send_telegram(message: str):
     except Exception as e:
         logging.error(f"Telegram 推送异常: {e}")
 
-# ------------------- 启动 Telegram 测试消息 -------------------
+# ------------------- 测试 Telegram 消息 -------------------
 send_telegram("✅ Telegram 测试消息：大单监控程序已启动！")
 
-# ------------------- 简单机器人过滤函数 -------------------
+# ------------------- 简单机器人过滤 -------------------
 def is_human_trade(trade):
-    """
-    简单过滤逻辑：
-    - 成交量过小或过于规则可能是机器人交易
-    """
     volume = trade.get("trade_volume", 0)
     if volume < 0.01 or volume == int(volume):
         return False
@@ -65,25 +56,14 @@ def is_human_trade(trade):
 
 # ------------------- WebSocket 回调 -------------------
 def on_trade(msg):
-    """
-    msg 示例：
-    {
-        "type": "trade",
-        "code": "KRW-SIGN",
-        "trade_price": 1000,
-        "trade_volume": 1000,
-        ...
-    }
-    """
     if msg.get("type") != "trade":
         return
-
     if not is_human_trade(msg):
-        return  # 过滤机器人交易
+        return
 
     price = msg["trade_price"]
     volume = msg["trade_volume"]
-    amount = price * volume  # 单笔成交金额
+    amount = price * volume
 
     if amount >= BIG_TRADE_THRESHOLD:
         message = (
@@ -96,14 +76,16 @@ def on_trade(msg):
         logging.info(message)
         send_telegram(message)
 
-# ------------------- 启动 WebSocket（最新版 pyupbit） -------------------
+# ------------------- 启动 WebSocket -------------------
 if __name__ == "__main__":
     try:
-        WebSocketClient.run_websocket_client(
-            markets=MARKETS,
-            type="trade",
-            callback=on_trade
+        ws = WebSocketClient(
+            on_message=on_trade, 
+            type="trade", 
+            markets=MARKETS
         )
+        ws.subscribe()
+        ws.run()
     except KeyboardInterrupt:
         logging.info("程序手动停止")
     except Exception as e:
