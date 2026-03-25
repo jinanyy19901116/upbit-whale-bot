@@ -1,135 +1,108 @@
-import time
-from collections import defaultdict
-import threading
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+import logging
 import requests
+from pyupbit import WebSocketClient
 
-# ==================== 配置 ====================
+# ------------------- Telegram 配置 -------------------
+# TODO: 在这里填写你的 Telegram Bot token 和 chat_id
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
-TELEGRAM_CHAT_ID = 5671949305
+TELEGRAM_CHAT_ID = "5671949305"
 
-# ==================== 参数 ====================
-BIG_MONEY = 200_000          # 单笔大单金额（美元）
-CHECK_INTERVAL = 60          # 每分钟刷新
-EXCLUDE_COINS = ["BTC","ETH","XRP","SOL","ADA","DOGE"]
-KOREA_EXCHANGES = ["upbit","bithumb","coinone","korbit"]
-CONSECUTIVE_COUNT = 3        # 连续大单次数触发信号
-CONSECUTIVE_WINDOW = 300     # 5分钟窗口统计连续大单
-PRICE_CHECK_MARGIN = 0.05    # 价格共振上下5%范围作为参考买入区间
+# ------------------- 大单阈值 & 监控币种 -------------------
+# 20万美元≈27,000,000 KRW，可根据汇率调整
+BIG_TRADE_THRESHOLD = 27_000_000  
 
-# ==================== Telegram ====================
-def tg(msg):
+# 监控交易对（小币种，韩国人偏好）
+MARKETS = [
+    "KRW-SIGN",   # Signum
+    "KRW-CHZ",    # Chiliz
+    "KRW-MANA",   # Decentraland
+    "KRW-SAND",   # Sandbox
+    "KRW-ENJ",    # Enjin Coin
+    "KRW-AAVE",   # Aave
+    "KRW-1INCH",  # 1inch
+    "KRW-CRV",    # Curve
+    "KRW-ANKR",   # Ankr
+    "KRW-LOOM",   # Loom Network
+]
+
+# ------------------- 日志设置 -------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logging.info("程序启动")
+
+# ------------------- Telegram 推送函数 -------------------
+def send_telegram(message: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"},
-            timeout=10
+        response = requests.post(url, data=data)
+        if response.status_code == 200:
+            logging.info("Telegram 推送成功")
+        else:
+            logging.error(f"Telegram 推送失败: {response.text}")
+    except Exception as e:
+        logging.error(f"Telegram 推送异常: {e}")
+
+# ------------------- 启动 Telegram 测试消息 -------------------
+send_telegram("✅ Telegram 测试消息：大单监控程序已启动！")
+
+# ------------------- 简单机器人过滤函数 -------------------
+def is_human_trade(trade):
+    """
+    简单过滤逻辑：
+    - 成交量过小或过于规则可能是机器人交易
+    """
+    volume = trade.get("trade_volume", 0)
+    if volume < 0.01 or volume == int(volume):
+        return False
+    return True
+
+# ------------------- WebSocket 回调 -------------------
+def on_trade(msg):
+    """
+    msg 示例：
+    {
+        "type": "trade",
+        "code": "KRW-SIGN",
+        "trade_price": 1000,
+        "trade_volume": 1000,
+        ...
+    }
+    """
+    if msg.get("type") != "trade":
+        return
+
+    if not is_human_trade(msg):
+        return  # 过滤机器人交易
+
+    price = msg["trade_price"]
+    volume = msg["trade_volume"]
+    amount = price * volume  # 单笔成交金额
+
+    if amount >= BIG_TRADE_THRESHOLD:
+        message = (
+            f"💰 大单成交！\n"
+            f"交易对: {msg['code']}\n"
+            f"价格: {price:,} KRW\n"
+            f"数量: {volume}\n"
+            f"成交额: {amount:,} KRW"
         )
-    except Exception as e:
-        print("Telegram推送失败:", e)
+        logging.info(message)
+        send_telegram(message)
 
-# ==================== 缓存 ====================
-flow_cache = defaultdict(list)
-known_coins = set()
-price_cache = defaultdict(list)
+# ------------------- 启动 WebSocket -------------------
+ws = WebSocketClient(markets=MARKETS, type="trade", on_message=on_trade)
 
-# ==================== Selenium 爬取 Arkham 数据 ====================
-def crawl_arkham_selenium():
-    url = "https://arkhamintelligence.com/transfers"  # Arkham交易列表
-    transfers = []
-
+if __name__ == "__main__":
     try:
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--no-sandbox")
-        driver = webdriver.Chrome(options=chrome_options)
-
-        driver.get(url)
-        time.sleep(5)
-
-        rows = driver.find_elements(By.CSS_SELECTOR,"table tbody tr")
-        for row in rows:
-            cols = row.find_elements(By.TAG_NAME,"td")
-            if len(cols)<4:
-                continue
-            symbol = cols[0].text.strip().upper()
-            try:
-                usd = float(cols[1].text.replace("$","").replace(",","").strip())
-            except:
-                usd = 0
-            exchange = cols[2].text.strip().lower()
-            t = cols[3].text.strip()
-            transfers.append({"symbol":symbol,"usdValue":usd,"toEntityName":exchange,"time":t})
-        driver.quit()
+        ws.run()
+    except KeyboardInterrupt:
+        logging.info("程序手动停止")
     except Exception as e:
-        print("Selenium爬取失败:", e)
-    return transfers
-
-# ==================== Selenium 爬取交易所实时价格 ====================
-def fetch_price(symbol):
-    # 示例：使用 Upbit 公开接口获取 KRW 价格（或替换为其他交易所API）
-    try:
-        url = f"https://api.upbit.com/v1/ticker?markets=KRW-{symbol}"
-        r = requests.get(url,timeout=5)
-        if r.status_code==200:
-            price = r.json()[0]["trade_price"]
-            return price
-    except:
-        return None
-    return None
-
-# ==================== 主监控逻辑 ====================
-def monitor():
-    print("🇰🇷 Arkham Selenium 监控 + 新币提醒 + 连续大单 + 实时价格启动")
-    while True:
-        now_time = time.time()
-        transfers = crawl_arkham_selenium()
-        for tx in transfers:
-            symbol = tx.get("symbol","")
-            usd = float(tx.get("usdValue",0))
-            exchange = tx.get("toEntityName","").lower()
-
-            if symbol in EXCLUDE_COINS or usd<BIG_MONEY:
-                continue
-            if not any(ex in exchange for ex in KOREA_EXCHANGES):
-                continue
-
-            # ==================== 新币提醒 ====================
-            if symbol not in known_coins:
-                tg(f"🆕 <b>新币上线</b>\n币种：{symbol}\n首次大单 ≥${BIG_MONEY:,.0f}")
-                known_coins.add(symbol)
-
-            # ==================== 连续大单缓存 ====================
-            flow_cache[symbol].append({"time":now_time,"amount":usd})
-            flow_cache[symbol] = [x for x in flow_cache[symbol] if now_time - x["time"]<CONSECUTIVE_WINDOW]
-
-            # ==================== 单笔大额提示 ====================
-            # 获取实时价格
-            price = fetch_price(symbol)
-            price_info = f"\n当前价格：{price:,.2f} KRW" if price else ""
-            # 参考买入区间
-            if price:
-                lower = price*(1-PRICE_CHECK_MARGIN)
-                upper = price*(1+PRICE_CHECK_MARGIN)
-                price_info += f"\n参考买入区间：{lower:,.2f} ~ {upper:,.2f} KRW"
-
-            tg(f"🇰🇷 <b>大单资金流</b>\n币种：{symbol}\n金额：${usd:,.0f}\n交易所：{exchange}{price_info}")
-
-            # ==================== 连续大单信号 ====================
-            if len(flow_cache[symbol])>=CONSECUTIVE_COUNT:
-                total = sum(x["amount"] for x in flow_cache[symbol])
-                tg(f"🔥 <b>连续大单警告（妖币启动信号）</b>\n币种：{symbol}\n次数：{len(flow_cache[symbol])}\n总金额：${total:,.0f}")
-                flow_cache[symbol].clear()
-
-        time.sleep(CHECK_INTERVAL)
-
-# ==================== 主程序 ====================
-if __name__=="__main__":
-    tg("🚀 启动（Arkham Selenium生产版 + 新币提醒 + 连续大单 + 实时价格参考）")
-    threading.Thread(target=monitor,daemon=True).start()
-
-    while True:
-        time.sleep(1)
+        logging.error(f"异常退出: {e}")
