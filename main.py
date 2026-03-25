@@ -1,16 +1,14 @@
 import logging
 import requests
-from pyupbit import WebSocketClient
+import pyupbit
 
 # ------------------- Telegram 配置 -------------------
-# TODO: 在这里填写你的 Telegram Bot token 和 chat_id
-TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
-TELEGRAM_CHAT_ID = "5671949305"
+TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI" 
+TELEGRAM_CHAT_ID = "5671949305"          
 
 # ------------------- 大单阈值 & 监控币种 -------------------
-BIG_TRADE_THRESHOLD = 27_000_000  # 约20万美元 KRW
+BIG_TRADE_THRESHOLD = 27_000_000  # KRW, 约20万美元
 
-# 小币种列表
 MARKETS = [
     "KRW-SIGN",
     "KRW-CHZ",
@@ -25,13 +23,11 @@ MARKETS = [
 ]
 
 # ------------------- 日志设置 -------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 logging.info("程序启动")
 
-# ------------------- Telegram 推送函数 -------------------
+# ------------------- Telegram 推送 -------------------
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -44,10 +40,10 @@ def send_telegram(message: str):
     except Exception as e:
         logging.error(f"Telegram 推送异常: {e}")
 
-# ------------------- 测试 Telegram 消息 -------------------
+# ------------------- 启动测试消息 -------------------
 send_telegram("✅ Telegram 测试消息：大单监控程序已启动！")
 
-# ------------------- 简单机器人过滤 -------------------
+# ------------------- 机器人过滤 -------------------
 def is_human_trade(trade):
     volume = trade.get("trade_volume", 0)
     if volume < 0.01 or volume == int(volume):
@@ -55,7 +51,7 @@ def is_human_trade(trade):
     return True
 
 # ------------------- WebSocket 回调 -------------------
-def on_trade(msg):
+def handle_trade(msg):
     if msg.get("type") != "trade":
         return
     if not is_human_trade(msg):
@@ -79,12 +75,11 @@ def on_trade(msg):
 # ------------------- 启动 WebSocket -------------------
 if __name__ == "__main__":
     try:
-        ws = WebSocketClient(
-            on_message=on_trade, 
-            type="trade", 
-            markets=MARKETS
+        ws = pyupbit.WebSocketClient(
+            type="trade",
+            markets=MARKETS,
+            callback=handle_trade
         )
-        ws.subscribe()
         ws.run()
     except KeyboardInterrupt:
         logging.info("程序手动停止")
