@@ -7,53 +7,39 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =========================
-# 🔑 Telegram（自己填）
+# 🔑 Telegram 配置
 # =========================
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
 # =========================
-# ⚙️ 参数
+# 参数配置
 # =========================
-MIN_USD = 20000
-BIG_USD = 200000
-ACCUM_USD = 300000
+MIN_USD = 20000        # 最低提醒金额
+BIG_USD = 200000       # 大单
+ACCUM_USD = 300000     # 吸筹累计阈值
+EXCHANGE_RATE = 1300   # KRW -> USD兜底
 
-EXCHANGE_RATE = 1300
-
-BLACKLIST = ["BTC", "ETH", "USDT"]
+BLACKLIST = ["BTC", "ETH", "USDT"]  # 屏蔽交易对
 
 markets = []
 known_markets = set()
 accum_data = {}
-binance_price = {}
+price_usd = {}  # CoinGecko 价格缓存
 
 # =========================
-# 📩 Telegram
+# 工具函数
 # =========================
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
-        }, timeout=5)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
     except:
         pass
 
-
-# =========================
-# 🕒 北京时间
-# =========================
 def now_bj():
-    return datetime.utcnow().replace(tzinfo=timezone.utc)\
-        .astimezone(timezone(timedelta(hours=8)))\
-        .strftime("%H:%M:%S")
+    return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
 
-
-# =========================
-# 💰 格式化
-# =========================
 def format_usd(x):
     if x >= 1_000_000:
         return f"${x/1_000_000:.2f}M"
@@ -61,200 +47,134 @@ def format_usd(x):
         return f"${x/1000:.1f}K"
     return f"${x:.0f}"
 
-
 # =========================
-# 🚀 获取Top30
+# 获取Top30交易对
 # =========================
 def get_top_markets():
     try:
         all_markets = requests.get("https://api.upbit.com/v1/market/all").json()
-
-        krw_markets = [
-            m["market"] for m in all_markets
-            if m["market"].startswith("KRW-")
-            and not any(x in m for x in BLACKLIST)
-        ]
-
-        res = requests.get(
-            "https://api.upbit.com/v1/ticker",
-            params={"markets": ",".join(krw_markets)}
-        ).json()
-
+        krw_markets = [m["market"] for m in all_markets if m["market"].startswith("KRW-") and not any(x in m for x in BLACKLIST)]
+        res = requests.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(krw_markets)}).json()
         if not isinstance(res, list):
             return []
-
         res.sort(key=lambda x: x["acc_trade_price_24h"], reverse=True)
-
-        return [r["market"] for r in res[:30]]
-
+        top = [r["market"] for r in res[:30]]
+        logging.info(f"监控市场: {top}")
+        return top
     except Exception as e:
-        logging.error(f"市场获取失败: {e}")
+        logging.error(f"获取市场失败: {e}")
         return []
 
-
 # =========================
-# 🆕 新币检测
+# 新币检测
 # =========================
 def check_new_listing():
     global known_markets
-
     try:
         res = requests.get("https://api.upbit.com/v1/market/all").json()
-
-        current = set([
-            m["market"] for m in res
-            if m["market"].startswith("KRW-")
-        ])
-
+        current = set([m["market"] for m in res if m["market"].startswith("KRW-")])
         if not known_markets:
             known_markets = current
             return
-
         new = current - known_markets
-
         for m in new:
             if any(x in m for x in BLACKLIST):
                 continue
-
             coin = m.replace("KRW-", "")
-
-            send_telegram(
-                f"🆕 新币上线\n{coin}/USDT\n⚠️ 注意波动"
-            )
-
+            send_telegram(f"🆕 新币上线\n{coin}/USDT\n⚠️ 注意首波波动")
         known_markets = current
-
     except Exception as e:
         logging.error(f"新币检测失败: {e}")
 
-
 # =========================
-# 💰 币安价格（修复版）
+# CoinGecko 价格更新
 # =========================
-def update_binance_price():
-    global binance_price
-
+def update_price():
+    global price_usd
     while True:
         try:
-            url = "https://api.binance.com/api/v3/ticker/price"
-            res = requests.get(url, timeout=5)
-
-            if res.status_code != 200:
-                logging.error(f"币安HTTP错误: {res.status_code}")
-                time.sleep(5)
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+            params = {"vs_currency": "usd", "order":"market_cap_desc", "per_page":250, "page":1}
+            res = requests.get(url, params=params, timeout=10).json()
+            if not isinstance(res, list):
+                logging.error(f"价格返回异常: {res}")
+                time.sleep(10)
                 continue
-
-            data = res.json()
-
-            if not isinstance(data, list):
-                logging.error(f"币安返回异常: {data}")
-                time.sleep(5)
-                continue
-
             temp = {}
-
-            for item in data:
-                symbol = item.get("symbol")
-                price = item.get("price")
-
-                if symbol and price and symbol.endswith("USDT"):
-                    coin = symbol.replace("USDT", "")
-                    temp[coin] = float(price)
-
-            binance_price = temp
-
+            for coin in res:
+                symbol = coin.get("symbol", "").upper()
+                p = coin.get("current_price")
+                if symbol and p:
+                    temp[symbol] = float(p)
+            price_usd = temp
         except Exception as e:
-            logging.error(f"币安价格失败: {e}")
-
-        time.sleep(10)
-
+            logging.error(f"价格更新失败: {e}")
+        time.sleep(20)
 
 # =========================
-# 🧠 交易处理
+# 处理成交信号
 # =========================
 def handle_trade(data):
     try:
         if "cd" not in data:
             return
-
         market = data["cd"]
         coin = market.replace("KRW-", "")
-
         if coin in BLACKLIST:
             return
-
         price_krw = data.get("tp", 0)
         volume = data.get("tv", 0)
         side = data.get("ab", "")
-
         if volume == 0:
             return
 
-        # ===== 优先币安价格 =====
-        if coin in binance_price:
-            price_usd = binance_price[coin]
-        else:
-            price_usd = price_krw / EXCHANGE_RATE
-
-        usd = price_usd * volume
-
-        if usd < MIN_USD:
+        # 优先 CoinGecko 价格
+        usd_price = price_usd.get(coin, price_krw / EXCHANGE_RATE)
+        usd_total = usd_price * volume
+        if usd_total < MIN_USD:
             return
 
-        # ===== 吸筹识别 =====
+        # 吸筹累计
         now = time.time()
-        acc = accum_data.get(coin, {"usd": 0, "time": now})
-
+        acc = accum_data.get(coin, {"usd":0,"time":now})
         if now - acc["time"] < 60:
-            acc["usd"] += usd
+            acc["usd"] += usd_total
         else:
-            acc = {"usd": usd, "time": now}
-
+            acc = {"usd":usd_total,"time":now}
         accum_data[coin] = acc
 
-        side_str = "🟢买入" if side == "BID" else "🔴卖出"
-
-        # ===== 信号评分 =====
+        side_str = "🟢买入" if side=="BID" else "🔴卖出"
         score = 0
-        if usd > BIG_USD:
-            score += 2
-        if acc["usd"] > ACCUM_USD:
-            score += 2
-
-        if score < 2:
+        if usd_total>BIG_USD:
+            score+=2
+        if acc["usd"]>ACCUM_USD:
+            score+=2
+        if score<2:
             return
 
-        # ===== 消息 =====
         msg = (
             f"{coin}/USDT\n"
             f"{side_str}\n"
-            f"💰 {format_usd(usd)}\n"
-            f"📍 {price_usd:.6f}\n"
+            f"💰 {format_usd(usd_total)}\n"
+            f"📍 {usd_price:.6f}\n"
             f"⏰ {now_bj()}"
         )
-
         send_telegram(msg)
-
     except Exception as e:
         logging.error(f"处理失败: {e}")
 
-
 # =========================
-# 🌐 WebSocket
+# WebSocket 高频
 # =========================
 def on_message(ws, message):
     try:
         if isinstance(message, bytes):
             message = message.decode("utf-8")
-
         data = json.loads(message)
-
         if isinstance(data, dict):
             handle_trade(data)
-
     except Exception as e:
         logging.error(f"WS错误: {e}")
-
 
 def run_ws():
     while True:
@@ -263,48 +183,35 @@ def run_ws():
                 "wss://api.upbit.com/websocket/v1",
                 on_message=on_message
             )
-
             def on_open(ws):
                 ws.send(json.dumps([
-                    {"ticket": "test"},
-                    {"type": "trade", "codes": markets}
+                    {"ticket":"test"},
+                    {"type":"trade","codes":markets}
                 ]))
-
             ws.on_open = on_open
-
             ws.run_forever(ping_interval=30)
-
         except Exception as e:
             logging.error(f"WS重连: {e}")
-
         time.sleep(3)
 
-
 # =========================
-# 🏁 主程序
+# 主程序
 # =========================
 def main():
     global markets
-
     logging.basicConfig(level=logging.INFO)
-    logging.info("🚀 启动")
-
+    logging.info("🚀 系统启动")
     send_telegram("✅ 系统启动成功")
-
     markets = get_top_markets()
 
-    threading.Thread(target=update_binance_price, daemon=True).start()
+    threading.Thread(target=update_price, daemon=True).start()
     threading.Thread(target=run_ws, daemon=True).start()
 
     while True:
         check_new_listing()
-
-        # 每5分钟刷新
         if int(time.time()) % 300 == 0:
             markets = get_top_markets()
-
         time.sleep(30)
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
