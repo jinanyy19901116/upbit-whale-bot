@@ -7,24 +7,19 @@ import logging
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
-MIN_USD = 200000
-NEW_COIN_USD = 100000
+MIN_USD = 50000
+STRONG_USD = 120000
 
 EXCLUDE = ["BTC", "ETH", "USDT"]
 
-# ================== 状态 ==================
-known_markets = set()
-new_coin_watchlist = {}
-trade_history = {}
 seen = set()
 buy_flow = {}
 last_price = {}
 
-# ================== 日志 ==================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 
 # ================== 工具 ==================
-def send_telegram(msg):
+def send(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -41,61 +36,34 @@ def format_usd(x):
         return f"${x/1_000:.0f}K"
     return f"${x:.0f}"
 
-def format_price(x):
-    if x >= 1:
-        return f"{x:.4f}"
-    elif x >= 0.01:
-        return f"{x:.6f}"
-    return f"{x:.8f}"
-
-# ================== 机器人过滤 ==================
-def is_bot_trade(symbol, usd, side):
-    if symbol not in trade_history:
-        trade_history[symbol] = []
-    trade_history[symbol].append((usd, side, time.time()))
-    trade_history[symbol] = trade_history[symbol][-10:]
-    amounts = [round(x[0], -3) for x in trade_history[symbol]]
-    return amounts.count(amounts[-1]) >= 3
-
-def is_arbitrage(symbol):
-    if symbol not in trade_history:
-        return False
-    sides = [x[1] for x in trade_history[symbol]]
-    flips = sum(1 for i in range(len(sides)-1) if sides[i] != sides[i+1])
-    return flips >= 4
-
-def is_fake_pump(absorb, pump, confirm):
-    return absorb and pump and not confirm
-
-# ================== 新币检测 ==================
-def check_new_listings():
-    global known_markets, new_coin_watchlist
+def get_binance_price(symbol):
     try:
-        res = requests.get("https://api.upbit.com/v1/market/all", timeout=5).json()
-        current = set([m["market"] for m in res if m["market"].startswith("KRW-")])
-        if not known_markets:
-            known_markets = current
-            return
-        new = current - known_markets
-        for m in new:
-            symbol = m.replace("KRW-", "")
-            if any(x in symbol for x in EXCLUDE):
-                continue
-            new_coin_watchlist[symbol] = time.time()
-            send_telegram(f"🆕 新币上线\n{symbol}/USDT")
-        known_markets = current
-    except Exception as e:
-        logging.error(f"新币检测失败: {e}")
+        r = requests.get(
+            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT",
+            timeout=3
+        ).json()
+        if "price" in r:
+            return float(r["price"])
+    except:
+        pass
+    return None
 
-# ================== 市场数据 ==================
+# ================== 市场 ==================
 def get_top_markets():
-    markets = requests.get("https://api.upbit.com/v1/market/all").json()
+    res = requests.get("https://api.upbit.com/v1/market/all").json()
     krw = [
-        m["market"] for m in markets
-        if m["market"].startswith("KRW-") and not any(x in m["market"] for x in EXCLUDE)
+        m["market"] for m in res
+        if m["market"].startswith("KRW-")
+        and not any(x in m["market"] for x in EXCLUDE)
     ]
-    tickers = requests.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(krw)}).json()
+
+    tickers = requests.get(
+        "https://api.upbit.com/v1/ticker",
+        params={"markets": ",".join(krw)}
+    ).json()
+
     sorted_m = sorted(tickers, key=lambda x: x["acc_trade_price_24h"], reverse=True)
+
     return [m["market"] for m in sorted_m[:30]]
 
 def get_trades(market):
@@ -108,121 +76,88 @@ def get_trades(market):
     except:
         return []
 
-def get_binance_price(symbol):
-    try:
-        res = requests.get(
-            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT",
-            timeout=3
-        ).json()
-        if "price" in res:
-            return float(res["price"])
-    except:
-        pass
-    return None
-
-# ================== 主循环 ==================
+# ================== 主逻辑 ==================
 def run():
-    logging.info("系统启动")
-    send_telegram("🚀 系统启动成功")
+    send("🚀 实盘信号系统启动")
 
     markets = get_top_markets()
+
     while True:
-        try:
-            check_new_listings()
+        for market in markets:
+            trades = get_trades(market)
 
-            for market in markets:
-                trades = get_trades(market)
-                for t in trades:
-                    try:
-                        tid = t["sequential_id"]
-                        if tid in seen:
-                            continue
-                        seen.add(tid)
+            for t in trades:
+                try:
+                    tid = t["sequential_id"]
+                    if tid in seen:
+                        continue
+                    seen.add(tid)
 
-                        price = t["trade_price"]
-                        volume = t["trade_volume"]
-                        side = t["ask_bid"]
-                        symbol = market.replace("KRW-", "")
+                    price = t["trade_price"]
+                    volume = t["trade_volume"]
+                    side = t["ask_bid"]
 
-                        # ===== 阈值 =====
-                        usd = volume * price  # 仅用于大小判断
-                        threshold = MIN_USD
-                        if symbol in new_coin_watchlist:
-                            if time.time() - new_coin_watchlist[symbol] < 1800:
-                                threshold = NEW_COIN_USD
-                        if usd < threshold:
-                            continue
+                    symbol = market.replace("KRW-", "")
 
-                        # ===== 机器人过滤 =====
-                        if is_bot_trade(symbol, usd, side):
-                            continue
-                        if is_arbitrage(symbol):
-                            continue
+                    # ===== Binance价格 =====
+                    binance_price = get_binance_price(symbol)
+                    if not binance_price:
+                        continue
 
-                        # ===== 核心：使用 Binance 价格 =====
-                        binance_price = get_binance_price(symbol)
-                        if not binance_price:
-                            continue  # 没有 Binance 价格就跳过
-                        price_usdt = binance_price
-                        usd_total = volume * price_usdt
+                    usd = volume * binance_price
 
-                        # ===== 买卖方向 =====
-                        side_str = "🟢买单" if side == "BID" else "🔴卖单"
+                    if usd < MIN_USD:
+                        continue
 
-                        ts = t["timestamp"] / 1000
-                        dt = datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=8)
-                        time_str = dt.strftime("%H:%M:%S")
+                    # ===== 吸筹 =====
+                    buy_flow[symbol] = buy_flow.get(symbol, 0)
+                    if side == "BID":
+                        buy_flow[symbol] += 1
+                    else:
+                        buy_flow[symbol] = 0
 
-                        # ===== 吸筹 =====
-                        buy_flow[symbol] = buy_flow.get(symbol, 0)
-                        if side == "BID":
-                            buy_flow[symbol] += 1
-                        else:
-                            buy_flow[symbol] = 0
-                        absorb = buy_flow[symbol] >= 3
+                    absorb = buy_flow[symbol] >= 2
 
-                        # ===== 拉盘 =====
-                        pump = False
-                        if symbol in last_price:
-                            if (price - last_price[symbol]) / last_price[symbol] > 0.01:
-                                pump = True
-                        last_price[symbol] = price
+                    # ===== 拉盘 =====
+                    pump = False
+                    if symbol in last_price:
+                        change = (price - last_price[symbol]) / last_price[symbol]
+                        if change > 0.006:
+                            pump = True
 
-                        confirm = True  # 使用 Binance 价格作为确认
+                    last_price[symbol] = price
 
-                        if is_fake_pump(absorb, pump, confirm):
-                            continue
+                    # ===== 信号分级 =====
+                    level = ""
+                    if usd > STRONG_USD and absorb and pump:
+                        level = "🔴机会（可考虑进场）"
+                    elif absorb and usd > STRONG_USD:
+                        level = "🟡强势（主力吸筹）"
+                    elif pump:
+                        level = "🟢可做（资金推动）"
+                    else:
+                        continue
 
-                        # ===== 评分 =====
-                        score = 0
-                        if usd_total > 300000: score += 20
-                        elif usd_total > 200000: score += 10
-                        if absorb: score += 25
-                        if pump: score += 25
-                        if confirm: score += 20
-                        level = "🔴极强" if score >= 90 else "🟠强" if score >= 75 else "🟡关注"
+                    side_str = "🟢买单" if side == "BID" else "🔴卖单"
 
-                        buy_signal = "🟢买入信号" if absorb and pump and confirm and side == "BID" else ""
+                    ts = t["timestamp"] / 1000
+                    dt = datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=8)
 
-                        # ===== Telegram 消息 =====
-                        msg = (
-                            f"{symbol}/USDT\n"
-                            f"{level} {buy_signal}\n"
-                            f"{side_str}\n"
-                            f"💰 {format_usd(usd_total)}\n"
-                            f"📍 {format_price(price_usdt)}\n"
-                            f"⏰ {time_str}"
-                        )
-                        send_telegram(msg)
+                    msg = (
+                        f"{symbol}/USDT\n"
+                        f"{level}\n"
+                        f"{side_str}\n"
+                        f"💰 {format_usd(usd)}\n"
+                        f"📍 {binance_price:.4f}\n"
+                        f"⏰ {dt.strftime('%H:%M:%S')}"
+                    )
 
-                    except Exception as e:
-                        logging.error(f"{market}解析失败: {e}")
+                    send(msg)
 
-                time.sleep(0.2)
+                except Exception as e:
+                    logging.error(e)
 
-        except Exception as e:
-            logging.error(f"主循环错误: {e}")
-            time.sleep(5)
+            time.sleep(0.2)
 
 if __name__ == "__main__":
     run()
