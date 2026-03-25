@@ -1,234 +1,146 @@
 import requests
 import time
+import datetime
 import logging
-from collections import defaultdict, deque
-from datetime import datetime, timezone, timedelta
 
-# ------------------- Telegram -------------------
+# ================== 配置 ==================
 TELEGRAM_TOKEN = "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
 TELEGRAM_CHAT_ID = "5671949305"
 
-# ------------------- 参数 -------------------
-BIG_TRADE = 27_000_000
-BURST = 80_000_000
-ACCUMULATION = 100_000_000
+MIN_USD = 200000  # 大单阈值（20万美元）
+KRW_TO_USD = 0.00075  # 汇率（可自行调整）
 
-TIME_WINDOW = 3
-ACC_WINDOW = 10
+EXCLUDE_MARKETS = ["KRW-BTC", "KRW-ETH", "KRW-USDT"]
 
-REQUEST_INTERVAL = 0.15
-LOOP_INTERVAL = 1
+# ================== 日志 ==================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ------------------- 日志 -------------------
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
-
-logging.info("程序启动")
-
-# ------------------- 汇率 -------------------
-def get_krw_usd():
+# ================== 工具函数 ==================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.get(
-            "https://api.exchangerate.host/latest?base=KRW&symbols=USD",
-            timeout=5
-        )
-        return r.json()["rates"]["USD"]
-    except:
-        return 0.00075
-
-KRW_TO_USD = get_krw_usd()
-last_rate_update = time.time()
-
-def to_usd(krw):
-    return krw * KRW_TO_USD
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg
+        }, timeout=10)
+    except Exception as e:
+        logging.error(f"Telegram发送失败: {e}")
 
 def format_usd(x):
     if x >= 1_000_000:
         return f"${x/1_000_000:.2f}M"
     elif x >= 1_000:
-        return f"${x/1_000:.1f}K"
+        return f"${x/1_000:.0f}K"
+    return f"${x:.0f}"
+
+def format_price(x):
+    if x >= 1:
+        return f"{x:.2f}"
+    elif x >= 0.01:
+        return f"{x:.4f}"
     else:
-        return f"${x:.0f}"
+        return f"{x:.6f}"
 
-# ------------------- 时间 -------------------
-def bj_time(ts):
-    utc = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-    bj = utc.astimezone(timezone(timedelta(hours=8)))
-    return bj.strftime("%H:%M:%S")
+def price_to_usdt(price_krw):
+    return price_krw * KRW_TO_USD
 
-# ------------------- Telegram -------------------
-def tg(msg):
+# ================== 获取Top30交易对 ==================
+def get_top_markets():
+    url = "https://api.upbit.com/v1/market/all"
+    markets = requests.get(url).json()
+
+    krw_markets = [
+        m["market"] for m in markets
+        if m["market"].startswith("KRW-")
+        and m["market"] not in EXCLUDE_MARKETS
+    ]
+
+    ticker_url = "https://api.upbit.com/v1/ticker"
+    tickers = requests.get(ticker_url, params={"markets": ",".join(krw_markets)}).json()
+
+    sorted_markets = sorted(tickers, key=lambda x: x["acc_trade_price_24h"], reverse=True)
+
+    return [m["market"] for m in sorted_markets[:30]]
+
+# ================== 获取成交 ==================
+def get_trades(market):
+    url = "https://api.upbit.com/v1/trades/ticks"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
-    except:
-        pass
-
-tg("✅ 监控系统启动（多行格式版）")
-
-# ------------------- 获取Top30 -------------------
-def get_top30():
-    try:
-        all_m = requests.get("https://api.upbit.com/v1/market/all", timeout=5).json()
-        krw = [
-            m["market"] for m in all_m
-            if m["market"].startswith("KRW-")
-            and m["market"] not in ["KRW-BTC", "KRW-ETH"]
-        ]
-
-        result = []
-        for m in krw:
-            try:
-                data = requests.get(
-                    f"https://api.upbit.com/v1/ticker?markets={m}",
-                    timeout=5
-                ).json()
-                vol = data[0]["acc_trade_price_24h"]
-                result.append((m, vol))
-                time.sleep(0.05)
-            except:
-                continue
-
-        result.sort(key=lambda x: x[1], reverse=True)
-        return [x[0] for x in result[:30]]
-    except:
+        res = requests.get(url, params={"market": market, "count": 5}, timeout=5)
+        return res.json()
+    except Exception as e:
+        logging.error(f"{market} 请求失败: {e}")
         return []
 
-# ------------------- 初始化 -------------------
-MARKETS = get_top30()
-logging.info(f"监控币种: {len(MARKETS)}")
+# ================== 主逻辑 ==================
+def run():
+    logging.info("程序启动")
 
-last_ts = {m: 0 for m in MARKETS}
+    send_telegram("✅ 监控系统已启动")
 
-burst_data = defaultdict(lambda: deque())
-acc_data = defaultdict(lambda: deque())
-price_cache = defaultdict(lambda: deque())
+    markets = get_top_markets()
+    logging.info(f"监控交易对: {markets}")
 
-signal_state = defaultdict(lambda: {"acc": False, "burst": False})
+    seen = set()
 
-# ------------------- 主循环 -------------------
-while True:
-    try:
-        # 汇率更新
-        if time.time() - last_rate_update > 600:
-            KRW_TO_USD = get_krw_usd()
-            last_rate_update = time.time()
-            logging.info(f"汇率更新: {KRW_TO_USD}")
+    while True:
+        try:
+            for market in markets:
+                trades = get_trades(market)
 
-        for market in MARKETS:
-            try:
-                r = requests.get(
-                    f"https://api.upbit.com/v1/trades/ticks?market={market}&count=10",
-                    timeout=5
-                )
+                for t in trades:
+                    try:
+                        trade_id = t["sequential_id"]
+                        if trade_id in seen:
+                            continue
+                        seen.add(trade_id)
 
-                if r.status_code != 200:
-                    continue
+                        price = t["trade_price"]
+                        volume = t["trade_volume"]
+                        side = t["ask_bid"]  # ASK卖 BID买
 
-                ticks = r.json()
-                if not isinstance(ticks, list):
-                    continue
+                        usd = price * volume * KRW_TO_USD
 
-                for t in reversed(ticks):
+                        if usd < MIN_USD:
+                            continue
 
-                    if not isinstance(t, dict):
-                        continue
+                        # 买卖方向
+                        if side == "BID":
+                            side_str = "🟢买单"
+                        else:
+                            side_str = "🔴卖单"
 
-                    ts = t.get("timestamp")
-                    if not ts or ts <= last_ts[market]:
-                        continue
+                        # 时间转北京时间
+                        ts = t["timestamp"] / 1000
+                        dt = datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=8)
+                        time_str = dt.strftime("%H:%M:%S")
 
-                    price = t.get("trade_price", 0)
-                    vol = t.get("trade_volume", 0)
-                    side = t.get("ask_bid", "")
+                        # 价格转USDT
+                        price_usdt = price_to_usdt(price)
 
-                    if price == 0 or vol == 0:
-                        continue
+                        # 币种格式
+                        symbol = market.replace("KRW-", "")
 
-                    amount = price * vol
-                    usd = to_usd(amount)
-
-                    now = time.time()
-                    time_str = bj_time(ts)
-
-                    # ------------------- 大单（多行格式）-------------------
-                    if amount >= BIG_TRADE:
-                        side_str = "🟢买单" if side == "BID" else "🔴卖单"
-
+                        # ================== Telegram消息 ==================
                         msg = (
-                            f"{market}\n"
+                            f"{symbol}/USDT\n"
                             f"{side_str}\n"
                             f"💰 {format_usd(usd)}\n"
-                            f"📍 {price}\n"
+                            f"📍 {format_price(price_usdt)}\n"
                             f"⏰ {time_str}"
                         )
 
-                        logging.info(msg)
-                        tg(msg)
+                        send_telegram(msg)
 
-                    # ------------------- 拉盘 -------------------
-                    if side == "BID":
-                        burst_data[market].append((now, amount))
+                    except Exception as e:
+                        logging.error(f"{market} 数据解析失败: {e}")
 
-                        while burst_data[market] and now - burst_data[market][0][0] > TIME_WINDOW:
-                            burst_data[market].popleft()
+                time.sleep(0.3)  # 限速
 
-                        total = sum(x[1] for x in burst_data[market])
+        except Exception as e:
+            logging.error(f"主循环异常: {e}")
+            time.sleep(5)
 
-                        if total >= BURST:
-                            signal_state[market]["burst"] = True
-                            tg(f"🚀拉盘 {market} {format_usd(to_usd(total))}")
-                            burst_data[market].clear()
-
-                    # ------------------- 吸筹 -------------------
-                    if side == "BID":
-                        acc_data[market].append((now, amount))
-
-                        while acc_data[market] and now - acc_data[market][0][0] > ACC_WINDOW:
-                            acc_data[market].popleft()
-
-                        acc_total = sum(x[1] for x in acc_data[market])
-
-                        if acc_total >= ACCUMULATION:
-                            signal_state[market]["acc"] = True
-                            tg(f"🟢吸筹 {market} {format_usd(to_usd(acc_total))}")
-                            acc_data[market].clear()
-
-                    # ------------------- 价格联动 -------------------
-                    price_cache[market].append((now, price))
-
-                    while price_cache[market] and now - price_cache[market][0][0] > 5:
-                        price_cache[market].popleft()
-
-                    if len(price_cache[market]) >= 2:
-                        old_price = price_cache[market][0][1]
-                        change = (price - old_price) / old_price
-
-                        # 买入信号
-                        if change > 0.01:
-                            tg(f"⚡上涨 {market} +{change*100:.2f}%")
-
-                            if signal_state[market]["acc"] and signal_state[market]["burst"]:
-                                tg(f"🟢【买入信号】{market} 🚀主力启动")
-                                signal_state[market] = {"acc": False, "burst": False}
-
-                        # 卖出信号
-                        elif change < -0.01:
-                            tg(f"⚡下跌 {market} {change*100:.2f}%")
-
-                            if signal_state[market]["acc"] or signal_state[market]["burst"]:
-                                tg(f"🔴【卖出信号】{market} ⚠️主力可能出货")
-                                signal_state[market] = {"acc": False, "burst": False}
-
-                    last_ts[market] = ts
-
-                time.sleep(REQUEST_INTERVAL)
-
-            except Exception as e:
-                logging.error(f"{market}错误: {e}")
-
-        time.sleep(LOOP_INTERVAL)
-
-    except Exception as e:
-        logging.error(f"主循环错误: {e}")
-        time.sleep(2)
+# ================== 启动 ==================
+if __name__ == "__main__":
+    run()
