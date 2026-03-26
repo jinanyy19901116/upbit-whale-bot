@@ -1,6 +1,7 @@
 import logging
 import time
-from collections import defaultdict, deque
+import threading
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -14,27 +15,20 @@ TELEGRAM_CHAT_ID = "5671949305"
 # =========================
 # 参数配置
 # =========================
-# 先把阈值调低，保证系统能稳定出信号
-MIN_USD = 20_000        # 最低提醒
-BIG_USD = 50_000       # 大单
-ACCUM_USD = 100_000    # 60秒累计吸筹
+MIN_USD = 5_000
+BIG_USD = 50_000
+ACCUM_USD = 100_000
 
-# 汇率兜底（1 USD = 多少 KRW）
 DEFAULT_USDKRW = 1350.0
 
-# 精确屏蔽
 BLACKLIST_MARKETS = {"KRW-BTC", "KRW-ETH", "KRW-USDT"}
 
-# 轮询频率
-POLL_INTERVAL = 5          # 每轮轮询间隔（秒）
-TOP_MARKETS_REFRESH = 600  # Top30刷新间隔（秒）
-NEW_LISTING_REFRESH = 60   # 新币检测间隔（秒）
-FX_REFRESH = 600           # 汇率刷新间隔（秒）
+POLL_INTERVAL = 5
+TOP_MARKETS_REFRESH = 600
+NEW_LISTING_REFRESH = 60
+FX_REFRESH = 600
 
-# 请求超时
 HTTP_TIMEOUT = 8
-
-# 去重容量
 SEEN_ID_MAXLEN = 20000
 
 # =========================
@@ -45,14 +39,11 @@ session = requests.Session()
 markets = []
 known_markets = set()
 
-# 1 USD = ? KRW
 usdkrw_rate = DEFAULT_USDKRW
 last_fx_update_ts = 0.0
 
-# 吸筹累计
 accum_data = {}
 
-# 去重
 seen_ids = set()
 seen_queue = deque()
 
@@ -147,7 +138,6 @@ def update_fx_rate(force=False):
     if not force and (now - last_fx_update_ts < FX_REFRESH):
         return
 
-    # 尽量少请求，失败就沿用旧值
     data = safe_get_json(
         "https://api.exchangerate.host/latest",
         params={"base": "USD", "symbols": "KRW"}
@@ -251,7 +241,6 @@ def handle_trade(market: str, trade: dict):
 
     seq_id = trade.get("sequential_id")
     if seq_id is None:
-        # 如果没有 sequential_id，就退化成时间+价格+量 去重
         seq_id = f"{market}-{trade.get('timestamp')}-{trade.get('trade_price')}-{trade.get('trade_volume')}"
 
     if not mark_seen(str(seq_id)):
@@ -272,13 +261,11 @@ def handle_trade(market: str, trade: dict):
     price_usd = krw_to_usd(price_krw)
     usd_total = price_usd * volume
 
-    # 调试日志，确认系统真的在流动
     logging.info(f"{coin} 成交 USD: {usd_total:.2f}")
 
     if usd_total < MIN_USD:
         return
 
-    # 60秒内累计吸筹
     now_ts = time.time()
     acc = accum_data.get(coin, {"usd": 0.0, "time": now_ts})
 
@@ -300,7 +287,6 @@ def handle_trade(market: str, trade: dict):
 
     side_str = "🟢买入" if side_raw == "BID" else "🔴卖出"
 
-    # 用成交时间，不用本机当前时间
     if isinstance(timestamp_ms, (int, float)) and timestamp_ms > 0:
         dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).astimezone(
             timezone(timedelta(hours=8))
@@ -336,7 +322,6 @@ def run_rest_polling():
                 if not isinstance(data, list):
                     continue
 
-                # 从旧到新处理
                 for trade in reversed(data):
                     handle_trade(market, trade)
 
@@ -364,7 +349,6 @@ def main():
     last_listing_refresh = time.time()
     last_fx_refresh = time.time()
 
-    # 启动轮询线程
     polling_thread = threading.Thread(target=run_rest_polling, daemon=True)
     polling_thread.start()
 
