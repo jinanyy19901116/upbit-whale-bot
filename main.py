@@ -213,7 +213,7 @@ def main():
         # 每5分钟更新Top30交易对
         if int(time.time()) % 300 == 0:
             markets = get_top_markets()
-        time.sleep(30)
+        time.sleep(120)
 
 if __name__=="__main__":
     main()
