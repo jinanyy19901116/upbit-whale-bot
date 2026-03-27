@@ -398,7 +398,8 @@ async def main() -> None:
     if not CONFIG["symbols"]:
         raise RuntimeError("SYMBOLS is empty")
 
-    tg = TelegramPusher(CONFIG["telegram_bot_token"], CONFIG["telegram_chat_id"])
+    tg = TelegramPusher(CONFIG["8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
+], CONFIG["5671949305"])
     states = {s: SymbolState(s) for s in CONFIG["symbols"]}
 
     timeout = aiohttp.ClientTimeout(total=None)
