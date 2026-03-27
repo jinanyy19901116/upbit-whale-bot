@@ -63,7 +63,7 @@ CONFIG = {
 
     # 扫单参数
     "sweep_window_sec": 1.2,
-    "sweep_min_notional_usdt": 50000.0,
+    "sweep_min_notional_usdt": 100000.0,
     "cooldown_sec": 15,
 
     # 稳定性参数
