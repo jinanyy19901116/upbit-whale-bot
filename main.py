@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import time
 from collections import deque, defaultdict
 from dataclasses import dataclass
@@ -10,70 +9,73 @@ import aiohttp
 import websockets
 
 
-def env_str(name: str, default: str) -> str:
-    value = os.getenv(name)
-    return value if value is not None and value != "" else default
-
-
-def env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return float(value)
-
-
-def env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return int(value)
-
-
-def env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def env_symbols(name: str, default: List[str]) -> List[str]:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    return [s.strip().lower() for s in raw.split(",") if s.strip()]
-
-
 CONFIG = {
-    "symbols": env_symbols(
-        "SYMBOLS",
-        ["signusdt", "ensusdt", "idusdt", "cvcusdt", "fetusdt", "renderusdt", "nearusdt", "grtusdt"],
-    ),
+    # 30 个“SIGN 类型”观察池（身份 / 凭证 / AI / 数据 / Agent / 相关叙事）
+    # 不保证每个交易所都全有；没有数据的不会影响程序继续运行
+    "symbols": [
+        "signusdt",
+        "ensusdt",
+        "idusdt",
+        "cvcusdt",
+        "wldusdt",
+        "layerusdt",
+        "fetusdt",
+        "renderusdt",
+        "nearusdt",
+        "grtusdt",
+        "icpusdt",
+        "arkmusdt",
+        "roseusdt",
+        "jasmyusdt",
+        "phbusdt",
+        "sklusdt",
+        "nmrusdt",
+        "oceanusdt",
+        "taousdt",
+        "agldusdt",
+        "aiusdt",
+        "actusdt",
+        "virtualusdt",
+        "tracusdt",
+        "ankrusdt",
+        "maskusdt",
+        "aliceusdt",
+        "portalusdt",
+        "zilusdt",
+        "avausdt",
+    ],
 
+    # Binance 市场数据 WS：优先用你已经验证可用的 vision
     "binance_ws_urls": [
         "wss://data-stream.binance.vision",
         "wss://stream.binance.com:443",
         "wss://stream.binance.com:9443",
     ],
-    "gate_ws_url": env_str("GATE_WS_URL", "wss://api.gateio.ws/ws/v4/"),
-    "gate_rest_url": env_str("GATE_REST_URL", "https://api.gateio.ws/api/v4"),
 
-    "telegram_bot_token": env_str("TELEGRAM_BOT_TOKEN", ""),
-    "telegram_chat_id": env_str("TELEGRAM_CHAT_ID", ""),
-    "telegram_test_on_start": env_bool("TELEGRAM_TEST_ON_START", True),
+    # Gate
+    "gate_ws_url": "wss://api.gateio.ws/ws/v4/",
+    "gate_rest_url": "https://api.gateio.ws/api/v4",
 
-    "sweep_window_sec": env_float("SWEEP_WINDOW_SEC", 1.2),
-    "sweep_min_notional_usdt": env_float("SWEEP_MIN_NOTIONAL_USDT", 50000.0),
-    "cooldown_sec": env_int("COOLDOWN_SEC", 15),
+    # 你提供的 Telegram
+    "telegram_bot_token": "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI",
+    "telegram_chat_id": "5671949305",
+    "telegram_test_on_start": True,
 
-    "heartbeat_sec": env_int("HEARTBEAT_SEC", 30),
-    "recv_timeout_sec": env_int("RECV_TIMEOUT_SEC", 60),
-    "reconnect_delay_sec": env_int("RECONNECT_DELAY_SEC", 5),
-    "ws_open_timeout_sec": env_int("WS_OPEN_TIMEOUT_SEC", 20),
-    "ws_ping_interval_sec": env_int("WS_PING_INTERVAL_SEC", 20),
-    "ws_ping_timeout_sec": env_int("WS_PING_TIMEOUT_SEC", 20),
-    "ws_force_reconnect_after_sec": env_int("WS_FORCE_RECONNECT_AFTER_SEC", 23 * 60 * 60),
+    # 扫单参数
+    "sweep_window_sec": 1.2,
+    "sweep_min_notional_usdt": 50000.0,
+    "cooldown_sec": 15,
 
-    "verbose": env_bool("VERBOSE", True),
+    # 稳定性参数
+    "heartbeat_sec": 30,
+    "recv_timeout_sec": 60,
+    "reconnect_delay_sec": 5,
+    "ws_open_timeout_sec": 20,
+    "ws_ping_interval_sec": 20,
+    "ws_ping_timeout_sec": 20,
+    "ws_force_reconnect_after_sec": 23 * 60 * 60,
+
+    "verbose": True,
 }
 
 
@@ -103,7 +105,7 @@ class TelegramPusher:
 
     async def send(self, session: aiohttp.ClientSession, text: str) -> bool:
         if not self.enabled:
-            log("[TG] skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 未配置")
+            log("[TG] skipped: token/chat_id 未配置")
             return False
 
         try:
@@ -140,8 +142,10 @@ class SymbolState:
         self.last_alert_at: Dict[str, float] = defaultdict(lambda: 0.0)
         self.last_trade_ts = 0.0
         self.last_trade_price = 0.0
+        self.binance_seen = False
+        self.gate_seen = False
 
-    def add_trade(self, price: float, size: float, side: str) -> None:
+    def add_trade(self, price: float, size: float, side: str, source: str) -> None:
         event = TradeEvent(
             ts=now_ts(),
             price=price,
@@ -158,6 +162,12 @@ class SymbolState:
 
         self.last_trade_ts = event.ts
         self.last_trade_price = price
+
+        if source == "binance":
+            self.binance_seen = True
+        elif source == "gate":
+            self.gate_seen = True
+
         self.cleanup()
 
     def cleanup(self) -> None:
@@ -193,7 +203,7 @@ class SymbolState:
                 f"窗口: {CONFIG['sweep_window_sec']:.1f} 秒\n"
                 f"累计成交额: {fmt_usdt(self.buy_notional)} USDT\n"
                 f"最近成交价: {self.last_trade_price:.8f}\n"
-                f"来源: 聚合成交流\n"
+                f"来源: 多交易所成交流\n"
             )
 
         if self.sell_notional >= CONFIG["sweep_min_notional_usdt"] and self.can_alert("sell"):
@@ -205,7 +215,7 @@ class SymbolState:
                 f"窗口: {CONFIG['sweep_window_sec']:.1f} 秒\n"
                 f"累计成交额: {fmt_usdt(self.sell_notional)} USDT\n"
                 f"最近成交价: {self.last_trade_price:.8f}\n"
-                f"来源: 聚合成交流\n"
+                f"来源: 多交易所成交流\n"
             )
 
         return alerts
@@ -275,7 +285,7 @@ async def run_binance(states: Dict[str, SymbolState]) -> None:
                     qty = float(data["q"])
                     side = "sell" if data.get("m", False) else "buy"
 
-                    states[symbol].add_trade(price, qty, side)
+                    states[symbol].add_trade(price, qty, side, "binance")
 
             except Exception as e:
                 log(f"[BINANCE ERROR] {e}")
@@ -354,7 +364,7 @@ async def run_gate(states: Dict[str, SymbolState]) -> None:
                     size = float(trade["amount"])
                     side = trade["side"].lower()
 
-                    states[pair].add_trade(price, size, side)
+                    states[pair].add_trade(price, size, side, "gate")
 
         except Exception as e:
             log(f"[GATE ERROR] {e}")
@@ -386,20 +396,25 @@ async def alert_loop(states: Dict[str, SymbolState], tg: TelegramPusher, session
 async def heartbeat_loop(states: Dict[str, SymbolState]) -> None:
     while True:
         await asyncio.sleep(CONFIG["heartbeat_sec"])
-        last_times = []
+        rows = []
         for symbol, state in states.items():
             age = int(now_ts() - state.last_trade_ts) if state.last_trade_ts > 0 else -1
-            last_times.append(f"{symbol}:{age}s")
+            src = []
+            if state.binance_seen:
+                src.append("B")
+            if state.gate_seen:
+                src.append("G")
+            src_text = "".join(src) if src else "-"
+            rows.append(f"{symbol}:{age}s:{src_text}")
 
-        log(f"[HEARTBEAT] {time.strftime('%Y-%m-%d %H:%M:%S')} | {' | '.join(last_times)}")
+        log(f"[HEARTBEAT] {time.strftime('%Y-%m-%d %H:%M:%S')} | {' | '.join(rows)}")
 
 
 async def main() -> None:
     if not CONFIG["symbols"]:
-        raise RuntimeError("SYMBOLS is empty")
+        raise RuntimeError("symbols is empty")
 
-    tg = TelegramPusher(CONFIG["8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI"
-], CONFIG["5671949305"])
+    tg = TelegramPusher(CONFIG["telegram_bot_token"], CONFIG["telegram_chat_id"])
     states = {s: SymbolState(s) for s in CONFIG["symbols"]}
 
     timeout = aiohttp.ClientTimeout(total=None)
@@ -407,7 +422,7 @@ async def main() -> None:
         await test_telegram(session, tg)
         await test_gate_rest(session)
 
-        log(f"[INIT] Using symbols: {', '.join(CONFIG['symbols'])}")
+        log(f"[INIT] Using symbols ({len(CONFIG['symbols'])}): {', '.join(CONFIG['symbols'])}")
 
         tasks = [
             asyncio.create_task(run_binance(states), name="binance"),
