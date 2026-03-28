@@ -115,10 +115,6 @@ def normalize_user_symbols(raw: List[str]) -> List[str]:
 USER_SYMBOLS = normalize_user_symbols(RAW_SYMBOLS)
 
 
-def to_binance_symbol(sym: str) -> str:
-    return sym.upper()
-
-
 def to_gate_symbol(sym: str) -> str:
     base = sym[:-4]
     return f"{base}_USDT"
@@ -137,6 +133,24 @@ def pct_change(old: Optional[float], new: Optional[float]) -> Optional[float]:
     if old is None or new is None or old == 0:
         return None
     return (new - old) / old
+
+
+def safe_float(v, default: float = 0.0) -> float:
+    try:
+        if v in (None, ""):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def safe_int(v, default: int = 0) -> int:
+    try:
+        if v in (None, ""):
+            return default
+        return int(float(v))
+    except Exception:
+        return default
 
 
 # =========================
@@ -171,7 +185,7 @@ class TelegramNotifier:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error("Telegram 发送失败: %s %s", resp.status, body)
+                    logger.error("Telegram 发送失败: %s %s", resp.status, body[:500])
         except Exception as e:
             logger.exception("Telegram 异常: %s", e)
 
@@ -201,12 +215,16 @@ class MarketState:
         self.oi_history: Dict[Tuple[str, str], Deque[Tuple[int, float]]] = defaultdict(deque)
 
     def update_price(self, exchange: str, symbol: str, price: float, ts_ms: int):
+        if price <= 0:
+            return
         key = (exchange, symbol)
         dq = self.price_history[key]
         dq.append((ts_ms, price))
         self._trim(dq, ts_ms, 6 * 60 * 1000)
 
     def update_oi(self, exchange: str, symbol: str, oi_usdt: float, ts_ms: int):
+        if oi_usdt <= 0:
+            return
         key = (exchange, symbol)
         dq = self.oi_history[key]
         dq.append((ts_ms, oi_usdt))
@@ -303,6 +321,8 @@ class MarketState:
 class BinanceContractCache:
     def __init__(self):
         self.valid_symbols: Set[str] = set()
+        self.available: bool = False
+        self.last_error_status: Optional[int] = None
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
@@ -318,20 +338,30 @@ class BinanceContractCache:
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
         try:
             async with self.session.get(url) as resp:
+                self.last_error_status = resp.status
                 if resp.status != 200:
-                    logger.error("Binance exchangeInfo 拉取失败: %s", resp.status)
+                    body = await resp.text()
+                    self.available = False
+                    logger.error("Binance exchangeInfo 拉取失败: %s %s", resp.status, body[:300])
                     return
+
                 data = await resp.json()
                 symbols = data.get("symbols", [])
                 valid = set()
+
                 for item in symbols:
-                    sym = item.get("symbol")
+                    if not isinstance(item, dict):
+                        continue
+                    sym = str(item.get("symbol", "")).upper()
                     status = item.get("status")
                     if sym and status == "TRADING":
-                        valid.add(sym.upper())
+                        valid.add(sym)
+
                 self.valid_symbols = valid
+                self.available = True
                 logger.info("Binance 合约列表已刷新，有效数量: %d", len(valid))
         except Exception as e:
+            self.available = False
             logger.exception("Binance 合约列表刷新异常: %s", e)
 
     async def auto_refresh_loop(self):
@@ -363,7 +393,8 @@ class GateContractCache:
         try:
             async with self.session.get(url) as resp:
                 if resp.status != 200:
-                    logger.error("Gate contracts 拉取失败: %s", resp.status)
+                    body = await resp.text()
+                    logger.error("Gate contracts 拉取失败: %s %s", resp.status, body[:300])
                     return
                 data = await resp.json()
 
@@ -372,21 +403,20 @@ class GateContractCache:
 
                 if isinstance(data, list):
                     for item in data:
+                        if not isinstance(item, dict):
+                            continue
                         contract = str(item.get("name") or item.get("contract") or "").upper()
                         if not contract:
                             continue
                         valid.add(contract)
-                        # Gate 常见字段为 quanto_multiplier；若接口返回不同，则回退为 1.0
+
                         raw_mult = (
                             item.get("quanto_multiplier")
                             or item.get("quantoMultiplier")
                             or item.get("multiplier")
                             or 1.0
                         )
-                        try:
-                            mults[contract] = float(raw_mult)
-                        except Exception:
-                            mults[contract] = 1.0
+                        mults[contract] = safe_float(raw_mult, 1.0)
 
                 self.valid_symbols = valid
                 self.multiplier_map = mults
@@ -426,8 +456,10 @@ class MexcContractCache:
         try:
             async with self.session.get(url) as resp:
                 if resp.status != 200:
-                    logger.error("MEXC contract detail 拉取失败: %s", resp.status)
+                    body = await resp.text()
+                    logger.error("MEXC contract detail 拉取失败: %s %s", resp.status, body[:300])
                     return
+
                 payload = await resp.json()
                 items = payload.get("data", [])
                 valid: Set[str] = set()
@@ -437,14 +469,13 @@ class MexcContractCache:
                     items = [items]
 
                 for item in items:
+                    if not isinstance(item, dict):
+                        continue
                     symbol = str(item.get("symbol") or "").upper()
                     if not symbol:
                         continue
                     valid.add(symbol)
-                    try:
-                        sizes[symbol] = float(item.get("contractSize", 1.0))
-                    except Exception:
-                        sizes[symbol] = 1.0
+                    sizes[symbol] = safe_float(item.get("contractSize"), 1.0)
 
                 self.valid_symbols = valid
                 self.contract_size_map = sizes
@@ -472,10 +503,12 @@ class SnapshotPoller:
         self,
         market_state: MarketState,
         binance_cache: BinanceContractCache,
+        gate_cache: GateContractCache,
         mexc_cache: MexcContractCache,
     ):
         self.market_state = market_state
         self.binance_cache = binance_cache
+        self.gate_cache = gate_cache
         self.mexc_cache = mexc_cache
         self.session: Optional[aiohttp.ClientSession] = None
 
@@ -490,29 +523,39 @@ class SnapshotPoller:
     # ---------- Binance ----------
     async def _poll_binance_symbol(self, symbol: str):
         sym = symbol.upper()
+        if not self.binance_cache.available:
+            return
         if not self.binance_cache.is_valid(sym):
             return
 
         try:
             async with self.session.get(
-                f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}"
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                params={"symbol": sym},
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    mark_price = float(data["markPrice"])
-                    ts_ms = int(data.get("time", int(datetime.now(tz=timezone.utc).timestamp() * 1000)))
+                    mark_price = safe_float(data.get("markPrice"))
+                    ts_ms = safe_int(
+                        data.get("time"),
+                        int(datetime.now(tz=timezone.utc).timestamp() * 1000),
+                    )
                     self.market_state.update_price("BINANCE", sym, mark_price, ts_ms)
         except Exception as e:
             logger.debug("Binance price 拉取失败 %s: %s", sym, e)
 
         try:
             async with self.session.get(
-                f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}"
+                "https://fapi.binance.com/fapi/v1/openInterest",
+                params={"symbol": sym},
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    oi_contracts = float(data["openInterest"])
-                    ts_ms = int(data.get("time", int(datetime.now(tz=timezone.utc).timestamp() * 1000)))
+                    oi_contracts = safe_float(data.get("openInterest"))
+                    ts_ms = safe_int(
+                        data.get("time"),
+                        int(datetime.now(tz=timezone.utc).timestamp() * 1000),
+                    )
 
                     price_dq = self.market_state.price_history.get(("BINANCE", sym))
                     if price_dq:
@@ -531,6 +574,51 @@ class SnapshotPoller:
                     logger.debug("Binance snapshot 异常 %s: %s", sym, e)
             await asyncio.sleep(SNAPSHOT_POLL_SEC)
 
+    # ---------- Gate ----------
+    async def _poll_gate_symbol(self, unified_symbol: str):
+        gate_sym = to_gate_symbol(unified_symbol)
+        if not self.gate_cache.is_valid(gate_sym):
+            return
+
+        # 价格
+        try:
+            async with self.session.get(
+                f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{gate_sym}"
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price = safe_float(data.get("mark_price") or data.get("last_price"))
+                    ts_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                    self.market_state.update_price("GATE", gate_sym, price, ts_ms)
+        except Exception as e:
+            logger.debug("Gate price 拉取失败 %s: %s", gate_sym, e)
+
+        # OI
+        try:
+            async with self.session.get(
+                "https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
+                params={"contract": gate_sym, "limit": 1},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and data:
+                        item = data[-1]
+                        if isinstance(item, dict):
+                            oi_usdt = safe_float(item.get("open_interest_usd"))
+                            ts_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                            self.market_state.update_oi("GATE", gate_sym, oi_usdt, ts_ms)
+        except Exception as e:
+            logger.debug("Gate OI 拉取失败 %s: %s", gate_sym, e)
+
+    async def poll_gate_loop(self, symbols: List[str]):
+        while True:
+            for sym in symbols:
+                try:
+                    await self._poll_gate_symbol(sym)
+                except Exception as e:
+                    logger.debug("Gate snapshot 异常 %s: %s", sym, e)
+            await asyncio.sleep(SNAPSHOT_POLL_SEC)
+
     # ---------- MEXC ----------
     async def _poll_mexc_symbol(self, symbol: str):
         sym = to_mexc_symbol(symbol)
@@ -545,14 +633,19 @@ class SnapshotPoller:
                 if resp.status == 200:
                     payload = await resp.json()
                     data = payload.get("data")
+
                     if isinstance(data, list):
                         data = data[0] if data else None
-                    if data:
-                        price = float(data.get("fairPrice") or data.get("lastPrice"))
-                        ts_ms = int(data.get("timestamp", int(datetime.now(tz=timezone.utc).timestamp() * 1000)))
+
+                    if isinstance(data, dict):
+                        price = safe_float(data.get("fairPrice") or data.get("lastPrice"))
+                        ts_ms = safe_int(
+                            data.get("timestamp"),
+                            int(datetime.now(tz=timezone.utc).timestamp() * 1000),
+                        )
                         self.market_state.update_price("MEXC", sym, price, ts_ms)
 
-                        hold_vol = float(data.get("holdVol", 0))
+                        hold_vol = safe_float(data.get("holdVol"))
                         contract_size = self.mexc_cache.get_contract_size(sym)
                         oi_usdt = hold_vol * contract_size * price
                         self.market_state.update_oi("MEXC", sym, oi_usdt, ts_ms)
@@ -576,7 +669,6 @@ class LargeTradeDetector:
     def __init__(self, notifier: TelegramNotifier, market_state: MarketState):
         self.notifier = notifier
         self.market_state = market_state
-
         self.last_alert_at: Dict[Tuple[str, str, str], float] = {}
         self.recent_same_side_trades: Dict[Tuple[str, str, str], Deque[TradeEvent]] = defaultdict(deque)
         self.recent_symbol_trades: Dict[Tuple[str, str], Deque[TradeEvent]] = defaultdict(deque)
@@ -708,6 +800,10 @@ class BinanceMonitor:
         self.cache = cache
 
     def _valid_symbols(self) -> List[str]:
+        if not self.cache.available:
+            logger.warning("Binance 当前不可用（可能是 451/地区限制），本轮跳过 Binance")
+            return []
+
         valid = []
         for s in self.symbols:
             if self.cache.is_valid(s):
@@ -721,7 +817,6 @@ class BinanceMonitor:
             try:
                 valid_symbols = self._valid_symbols()
                 if not valid_symbols:
-                    logger.warning("Binance 没有可订阅的有效合约，60秒后重试")
                     await asyncio.sleep(60)
                     continue
 
@@ -733,15 +828,20 @@ class BinanceMonitor:
                     async for raw in ws:
                         msg = json.loads(raw)
                         data = msg.get("data")
-                        if not data or data.get("e") != "aggTrade":
+                        if not isinstance(data, dict):
+                            continue
+                        if data.get("e") != "aggTrade":
                             continue
 
-                        symbol = data["s"].upper()
-                        price = float(data["p"])
-                        qty = float(data["q"])
+                        symbol = str(data.get("s", "")).upper()
+                        if not symbol:
+                            continue
+
+                        price = safe_float(data.get("p"))
+                        qty = safe_float(data.get("q"))
                         notional = price * qty
                         side = "SELL" if data.get("m", False) else "BUY"
-                        ts_ms = int(data["T"])
+                        ts_ms = safe_int(data.get("T"), int(time.time() * 1000))
 
                         self.market_state.update_price("BINANCE", symbol, price, ts_ms)
 
@@ -803,22 +903,18 @@ class GateMonitor:
                         "payload": valid_symbols,
                     }))
 
-                    for sym in valid_symbols:
-                        await ws.send(json.dumps({
-                            "time": int(time.time()),
-                            "channel": "futures.tickers",
-                            "event": "subscribe",
-                            "payload": [sym],
-                        }))
-                        await ws.send(json.dumps({
-                            "time": int(time.time()),
-                            "channel": "futures.contract_stats",
-                            "event": "subscribe",
-                            "payload": [sym, "1m"],
-                        }))
+                    await ws.send(json.dumps({
+                        "time": int(time.time()),
+                        "channel": "futures.tickers",
+                        "event": "subscribe",
+                        "payload": valid_symbols,
+                    }))
 
                     async for raw in ws:
                         msg = json.loads(raw)
+                        if not isinstance(msg, dict):
+                            continue
+
                         channel = msg.get("channel")
                         event = msg.get("event")
 
@@ -830,14 +926,23 @@ class GateMonitor:
 
                         if channel == "futures.trades" and event == "update":
                             result = msg.get("result", [])
+                            if not isinstance(result, list):
+                                continue
+
                             for item in result:
+                                if not isinstance(item, dict):
+                                    continue
+
                                 contract = str(item.get("contract", "")).upper()
                                 if not contract:
                                     continue
 
-                                price = float(item["price"])
-                                size = int(item["size"])
-                                ts_ms = int(item.get("create_time_ms") or msg.get("time_ms") or int(time.time() * 1000))
+                                price = safe_float(item.get("price"))
+                                size = safe_float(item.get("size"))
+                                ts_ms = safe_int(
+                                    item.get("create_time_ms") or msg.get("time_ms"),
+                                    int(time.time() * 1000),
+                                )
 
                                 multiplier = self.cache.get_multiplier(contract)
                                 qty_coin = abs(size) * multiplier
@@ -861,33 +966,20 @@ class GateMonitor:
 
                         elif channel == "futures.tickers" and event == "update":
                             result = msg.get("result", [])
-                            ts_ms = int(msg.get("time_ms") or int(time.time() * 1000))
+                            if not isinstance(result, list):
+                                continue
+
+                            ts_ms = safe_int(msg.get("time_ms"), int(time.time() * 1000))
                             for item in result:
+                                if not isinstance(item, dict):
+                                    continue
+
                                 contract = str(item.get("contract", "")).upper()
                                 if not contract:
                                     continue
-                                price = float(item.get("mark_price") or item.get("last"))
+
+                                price = safe_float(item.get("mark_price") or item.get("last"))
                                 self.market_state.update_price("GATE", contract, price, ts_ms)
-
-                        elif channel == "futures.contract_stats" and event == "update":
-                            result = msg.get("result", [])
-                            contract = None
-                            # 某些实现里 ws 不回 contract，因此从最近一次订阅映射到通道粒度较难区分；
-                            # 这里优先尝试消息里直接带 contract，没有则跳过 OI 更新。
-                            for item in result:
-                                contract = item.get("contract")
-                                if contract:
-                                    break
-
-                            # 若消息未带 contract，通常只能依赖订阅上下文；这里做保守处理，不硬猜。
-                            if not contract:
-                                continue
-
-                            contract = str(contract).upper()
-                            ts_ms = int(item.get("time", int(time.time())) * 1000)
-                            oi_usdt = float(item.get("open_interest_usd", 0))
-                            if oi_usdt > 0:
-                                self.market_state.update_oi("GATE", contract, oi_usdt, ts_ms)
 
             except Exception as e:
                 logger.exception("Gate 异常: %s", e)
@@ -945,6 +1037,8 @@ class MexcMonitor:
 
                         async for raw in ws:
                             msg = json.loads(raw)
+                            if not isinstance(msg, dict):
+                                continue
 
                             channel = msg.get("channel")
                             if channel == "pong":
@@ -954,18 +1048,23 @@ class MexcMonitor:
 
                             symbol = str(msg.get("symbol", "")).upper()
                             data = msg.get("data", [])
-                            if not symbol or not data:
+                            if not symbol or not isinstance(data, list):
                                 continue
 
                             contract_size = self.cache.get_contract_size(symbol)
 
                             for item in data:
-                                price = float(item["p"])
-                                contracts = float(item["v"])
+                                if not isinstance(item, dict):
+                                    continue
+
+                                price = safe_float(item.get("p"))
+                                contracts = safe_float(item.get("v"))
                                 qty_coin = contracts * contract_size
                                 notional = price * qty_coin
-                                side = "BUY" if int(item["T"]) == 1 else "SELL"
-                                ts_ms = int(item["t"])
+
+                                t_side = safe_int(item.get("T"), 0)
+                                side = "BUY" if t_side == 1 else "SELL"
+                                ts_ms = safe_int(item.get("t"), int(time.time() * 1000))
 
                                 self.market_state.update_price("MEXC", symbol, price, ts_ms)
 
@@ -1010,6 +1109,7 @@ async def main():
     snapshot_poller = SnapshotPoller(
         market_state=market_state,
         binance_cache=binance_cache,
+        gate_cache=gate_cache,
         mexc_cache=mexc_cache,
     )
     await snapshot_poller.start()
@@ -1030,6 +1130,7 @@ async def main():
             gate_cache.auto_refresh_loop(),
             mexc_cache.auto_refresh_loop(),
             snapshot_poller.poll_binance_loop(USER_SYMBOLS),
+            snapshot_poller.poll_gate_loop(USER_SYMBOLS),
             snapshot_poller.poll_mexc_loop(USER_SYMBOLS),
             *(m.run() for m in monitors),
         )
