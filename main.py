@@ -4,15 +4,16 @@ import time
 import asyncio
 import logging
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import websockets
 from fastapi import FastAPI
 
 # =========================================================
-# 基础
+# 基础配置
 # =========================================================
 
 logging.basicConfig(
@@ -21,8 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-app = FastAPI(title="Flow Signal Scanner WS", version="4.0.0")
-
 # =========================================================
 # 环境变量
 # =========================================================
@@ -30,36 +29,18 @@ app = FastAPI(title="Flow Signal Scanner WS", version="4.0.0")
 PORT = int(os.getenv("PORT", "8080"))
 AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
+ENABLE_GATE = os.getenv("ENABLE_GATE", "true").lower() in ("1", "true", "yes", "on")
+ENABLE_MEXC = os.getenv("ENABLE_MEXC", "true").lower() in ("1", "true", "yes", "on")
+
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
-# Upbit 区域
-UPBIT_REGION = os.getenv("UPBIT_REGION", "sg").strip().lower()
-UPBIT_WS_URL = f"wss://{UPBIT_REGION}-api.upbit.com/websocket/v1"
-UPBIT_REST_BASE = f"https://{UPBIT_REGION}-api.upbit.com"
+# =========================================================
+# 监控币名单
+# =========================================================
 
-# 交易所开关
-ENABLE_GATE = os.getenv("ENABLE_GATE", "true").lower() in ("1", "true", "yes", "on")
-ENABLE_MEXC = os.getenv("ENABLE_MEXC", "true").lower() in ("1", "true", "yes", "on")
-ENABLE_UPBIT = os.getenv("ENABLE_UPBIT", "true").lower() in ("1", "true", "yes", "on")
-
-# 风控 / 信号参数
-LARGE_TRADE_USDT = float(os.getenv("LARGE_TRADE_USDT", "20000"))
-RECENT_WINDOW_MINUTES = int(os.getenv("RECENT_WINDOW_MINUTES", "3"))
-BASELINE_WINDOW_MINUTES = int(os.getenv("BASELINE_WINDOW_MINUTES", "15"))
-CACHE_KEEP_MINUTES = int(os.getenv("CACHE_KEEP_MINUTES", "30"))
-
-MIN_RECENT_NOTIONAL_USDT = float(os.getenv("MIN_RECENT_NOTIONAL_USDT", "50000"))
-ACTIVITY_RATIO_THRESHOLD = float(os.getenv("ACTIVITY_RATIO_THRESHOLD", "2.5"))
-BUY_SELL_IMBALANCE_THRESHOLD = float(os.getenv("BUY_SELL_IMBALANCE_THRESHOLD", "1.8"))
-LARGE_ORDER_IMBALANCE_THRESHOLD = float(os.getenv("LARGE_ORDER_IMBALANCE_THRESHOLD", "1.5"))
-ORDERBOOK_IMBALANCE_THRESHOLD = float(os.getenv("ORDERBOOK_IMBALANCE_THRESHOLD", "1.3"))
-
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "7200"))
-
-# 扫描币
 RAW_WATCHLIST = [
     "SIGNUSDT", "KITEUSDT", "HYPEUSDT", "SIRNUSDT", "PHAUSDT", "POWERUSDT",
     "SKYAIUSDT", "BARDUSDT", "QUSDT", "UAIUSDT", "HUSDT", "ICXUSDT",
@@ -67,6 +48,30 @@ RAW_WATCHLIST = [
     "ANKRUSDT", "ANIMEUSDT", "BANUSDT", "GUNUSDT", "ZROUSDT", "CUSDT",
     "LIGHTUSDT", "CVCUSDT", "AVAUSDT",
 ]
+
+# =========================================================
+# 信号参数
+# =========================================================
+
+# 单笔成交额达到这个值，视为大单
+LARGE_TRADE_USDT = float(os.getenv("LARGE_TRADE_USDT", "20000"))
+
+# 最近窗口 & 基线窗口
+RECENT_WINDOW_MINUTES = int(os.getenv("RECENT_WINDOW_MINUTES", "3"))
+BASELINE_WINDOW_MINUTES = int(os.getenv("BASELINE_WINDOW_MINUTES", "15"))
+CACHE_KEEP_MINUTES = int(os.getenv("CACHE_KEEP_MINUTES", "30"))
+
+# 最近窗口最少成交额，否则不判信号
+MIN_RECENT_NOTIONAL_USDT = float(os.getenv("MIN_RECENT_NOTIONAL_USDT", "50000"))
+
+# 判定阈值
+ACTIVITY_RATIO_THRESHOLD = float(os.getenv("ACTIVITY_RATIO_THRESHOLD", "2.5"))
+BUY_SELL_IMBALANCE_THRESHOLD = float(os.getenv("BUY_SELL_IMBALANCE_THRESHOLD", "1.8"))
+LARGE_ORDER_IMBALANCE_THRESHOLD = float(os.getenv("LARGE_ORDER_IMBALANCE_THRESHOLD", "1.5"))
+ORDERBOOK_IMBALANCE_THRESHOLD = float(os.getenv("ORDERBOOK_IMBALANCE_THRESHOLD", "1.3"))
+
+# 同交易所 + 同币 + 同方向 的冷却时间
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "7200"))
 
 # =========================================================
 # 工具函数
@@ -102,9 +107,6 @@ def gate_contract(base: str) -> str:
 def mexc_contract(base: str) -> str:
     return f"{base}_USDT"
 
-def upbit_market(base: str) -> str:
-    return f"USDT-{base}"
-
 def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None or value == "":
@@ -138,22 +140,24 @@ WATCHLIST_BASE_SET = set(WATCHLIST_BASES)
 
 GATE_SYMBOLS = [gate_contract(x) for x in WATCHLIST_BASES]
 MEXC_SYMBOLS = [mexc_contract(x) for x in WATCHLIST_BASES]
-UPBIT_SYMBOLS = [upbit_market(x) for x in WATCHLIST_BASES]
 
 # =========================================================
-# 共享状态
+# 全局状态
 # =========================================================
 
-# 最新静态市场信息
+# market_state["gate:SIGN_USDT"] = {...}
 market_state: Dict[str, Dict[str, Any]] = {}
-# orderbook_state["gate:BTC_USDT"] = {"bids":[(p,s)], "asks":[(p,s)], "ts_ms": ...}
+
+# orderbook_state["gate:SIGN_USDT"] = {"bids":[(p,s)], "asks":[(p,s)], "ts_ms": ...}
 orderbook_state: Dict[str, Dict[str, Any]] = {}
-# trade_cache["gate:BTC_USDT"] = deque([...])
-trade_cache: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10000))
-# 去重告警
+
+# trade_cache["gate:SIGN_USDT"] = deque([...])
+trade_cache: Dict[str, deque] = defaultdict(lambda: deque(maxlen=12000))
+
+# 防重复推送
 last_alert_sent_at: Dict[str, float] = {}
 
-# 启动任务句柄
+# 后台任务
 _bg_tasks: List[asyncio.Task] = []
 
 # =========================================================
@@ -165,18 +169,13 @@ def market_key(exchange: str, raw_symbol: str) -> str:
 
 def base_from_raw_symbol(exchange: str, raw_symbol: str) -> Optional[str]:
     rs = raw_symbol.upper()
-    if exchange in ("gate", "mexc"):
-        if rs.endswith("_USDT"):
-            return rs[:-5]
-    elif exchange == "upbit":
-        if rs.startswith("USDT-"):
-            return rs.split("-", 1)[1]
+    if rs.endswith("_USDT"):
+        return rs[:-5]
     return None
 
 def make_market_item(
     *,
     exchange: str,
-    market_type: str,
     raw_symbol: str,
     last_price: Optional[float] = None,
     volume_24h: Optional[float] = None,
@@ -186,7 +185,7 @@ def make_market_item(
     base = base_from_raw_symbol(exchange, raw_symbol)
     return {
         "exchange": exchange,
-        "market_type": market_type,
+        "market_type": "futures",
         "raw_symbol": raw_symbol,
         "base": base,
         "symbol": to_internal_symbol(base) if base else raw_symbol,
@@ -212,7 +211,7 @@ def make_trade_record(
         "price": price,
         "size": size,
         "side": side,  # buy / sell / unknown
-        "notional": price * size,
+        "notional": (price or 0.0) * (size or 0.0),
         "ts_ms": ts_ms,
     }
 
@@ -222,7 +221,7 @@ def prune_trade_cache(records: deque, current_ms: int, keep_minutes: int = CACHE
         records.popleft()
 
 # =========================================================
-# 信号逻辑
+# 信号计算
 # =========================================================
 
 def calc_trade_flow_stats(records: List[Dict[str, Any]], current_ms: int) -> Dict[str, Any]:
@@ -249,11 +248,23 @@ def calc_trade_flow_stats(records: List[Dict[str, Any]], current_ms: int) -> Dic
     buy_notional = sum(x["notional"] for x in recent if x["side"] == "buy")
     sell_notional = sum(x["notional"] for x in recent if x["side"] == "sell")
 
-    buy_large_notional = sum(x["notional"] for x in recent if x["side"] == "buy" and x["notional"] >= LARGE_TRADE_USDT)
-    sell_large_notional = sum(x["notional"] for x in recent if x["side"] == "sell" and x["notional"] >= LARGE_TRADE_USDT)
+    buy_large_notional = sum(
+        x["notional"] for x in recent
+        if x["side"] == "buy" and x["notional"] >= LARGE_TRADE_USDT
+    )
+    sell_large_notional = sum(
+        x["notional"] for x in recent
+        if x["side"] == "sell" and x["notional"] >= LARGE_TRADE_USDT
+    )
 
-    buy_large_count = sum(1 for x in recent if x["side"] == "buy" and x["notional"] >= LARGE_TRADE_USDT)
-    sell_large_count = sum(1 for x in recent if x["side"] == "sell" and x["notional"] >= LARGE_TRADE_USDT)
+    buy_large_count = sum(
+        1 for x in recent
+        if x["side"] == "buy" and x["notional"] >= LARGE_TRADE_USDT
+    )
+    sell_large_count = sum(
+        1 for x in recent
+        if x["side"] == "sell" and x["notional"] >= LARGE_TRADE_USDT
+    )
 
     if sell_notional > 0:
         buy_sell_imbalance = buy_notional / sell_notional
@@ -372,7 +383,10 @@ async def send_telegram_message(text: str) -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+    }
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -401,7 +415,7 @@ def format_signal_message(item: Dict[str, Any], flow: Dict[str, Any], signal: Di
         f"",
         f"时间（北京时间）：{beijing_now_str()}",
         f"交易所：{item['exchange']}",
-        f"市场：{'合约' if item['market_type'] == 'futures' else '现货'}",
+        f"市场：合约",
         f"币种：{item['symbol']}",
         f"交易对：{item['raw_symbol']}",
         f"最新价格：{format_number(item.get('last_price'), 6)}",
@@ -421,13 +435,12 @@ def format_signal_message(item: Dict[str, Any], flow: Dict[str, Any], signal: Di
     return "\n".join(lines)
 
 # =========================================================
-# 状态写入
+# 状态写入与评估
 # =========================================================
 
 async def on_trade(exchange: str, raw_symbol: str, price: float, size: float, side: str, ts_ms: int) -> None:
     key = market_key(exchange, raw_symbol)
 
-    # 写入 trade cache
     records = trade_cache[key]
     rec = make_trade_record(
         exchange=exchange,
@@ -438,7 +451,6 @@ async def on_trade(exchange: str, raw_symbol: str, price: float, size: float, si
         ts_ms=ts_ms,
     )
 
-    # 简单去重
     signature = (rec["ts_ms"], rec["price"], rec["size"], rec["side"])
     recent_sigs = set((x["ts_ms"], x["price"], x["size"], x["side"]) for x in list(records)[-300:])
     if signature not in recent_sigs:
@@ -446,22 +458,20 @@ async def on_trade(exchange: str, raw_symbol: str, price: float, size: float, si
 
     prune_trade_cache(records, now_ms())
 
-    # 更新 last_price
-    current = market_state.get(key)
-    if current:
-        current["last_price"] = price
-        current["updated_at"] = utc_now_iso()
-    else:
+    item = market_state.get(key)
+    if item is None:
         market_state[key] = make_market_item(
             exchange=exchange,
-            market_type="futures" if exchange in ("gate", "mexc") else "spot",
             raw_symbol=raw_symbol,
             last_price=price,
         )
+    else:
+        item["last_price"] = price
+        item["updated_at"] = utc_now_iso()
 
     await evaluate_and_alert(exchange, raw_symbol)
 
-async def on_orderbook(exchange: str, raw_symbol: str, bids: List[tuple], asks: List[tuple], ts_ms: int) -> None:
+async def on_orderbook(exchange: str, raw_symbol: str, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], ts_ms: int) -> None:
     key = market_key(exchange, raw_symbol)
     orderbook_state[key] = {
         "bids": bids[:10],
@@ -476,7 +486,6 @@ async def on_ticker(exchange: str, raw_symbol: str, last_price: Optional[float],
     if item is None:
         market_state[key] = make_market_item(
             exchange=exchange,
-            market_type="futures" if exchange in ("gate", "mexc") else "spot",
             raw_symbol=raw_symbol,
             last_price=last_price,
             volume_24h=volume_24h,
@@ -516,12 +525,16 @@ async def evaluate_and_alert(exchange: str, raw_symbol: str) -> None:
         if ok:
             mark_alert_sent(exchange, item["symbol"], signal["signal_type"])
             logger.info("已推送信号 exchange=%s symbol=%s type=%s", exchange, item["symbol"], signal["signal_type"])
+        else:
+            logger.info("命中信号但未推送 exchange=%s symbol=%s type=%s telegram_enabled=%s",
+                        exchange, item["symbol"], signal["signal_type"], TELEGRAM_ENABLED)
 
 # =========================================================
-# Gate WS
+# Gate WebSocket
+# Gate futures WS 文档提供 usdt 连接地址与期货频道。:contentReference[oaicite:2]{index=2}
 # =========================================================
 
-async def gate_ping_loop(ws):
+async def gate_ping_loop(ws) -> None:
     while True:
         await asyncio.sleep(20)
         try:
@@ -532,13 +545,26 @@ async def gate_ping_loop(ws):
         except Exception:
             return
 
-async def gate_ws_loop():
+async def gate_ws_loop() -> None:
     url = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 
     while True:
         try:
             logger.info("连接 Gate WS...")
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=None,
+            ) as ws:
+                # ticker
+                await ws.send(json.dumps({
+                    "time": int(time.time()),
+                    "channel": "futures.tickers",
+                    "event": "subscribe",
+                    "payload": GATE_SYMBOLS,
+                }))
+
                 # trades
                 await ws.send(json.dumps({
                     "time": int(time.time()),
@@ -546,7 +572,8 @@ async def gate_ws_loop():
                     "event": "subscribe",
                     "payload": GATE_SYMBOLS,
                 }))
-                # full orderbook
+
+                # order book
                 for sym in GATE_SYMBOLS:
                     await ws.send(json.dumps({
                         "time": int(time.time()),
@@ -567,64 +594,106 @@ async def gate_ws_loop():
                     event = msg.get("event")
 
                     if channel == "futures.tickers" and event == "update":
-                        for row in msg.get("result", []):
-                            raw_symbol = str(row.get("contract", "")).upper()
-                            if raw_symbol in GATE_SYMBOLS:
-                                await on_ticker(
-                                    exchange="gate",
-                                    raw_symbol=raw_symbol,
-                                    last_price=safe_float(row.get("last")),
-                                    volume_24h=safe_float(row.get("volume_24h_quote")),
-                                    open_interest=safe_float(row.get("total_size")),
-                                    funding_rate=safe_float(row.get("funding_rate")),
-                                )
-
-                    elif channel == "futures.trades" and event == "update":
-                        for row in msg.get("result", []):
+                        result = msg.get("result", [])
+                        if isinstance(result, dict):
+                            result = [result]
+                        for row in result:
                             raw_symbol = str(row.get("contract", "")).upper()
                             if raw_symbol not in GATE_SYMBOLS:
                                 continue
+                            await on_ticker(
+                                exchange="gate",
+                                raw_symbol=raw_symbol,
+                                last_price=safe_float(row.get("last")),
+                                volume_24h=safe_float(row.get("volume_24h_quote")),
+                                open_interest=safe_float(row.get("total_size")),
+                                funding_rate=safe_float(row.get("funding_rate")),
+                            )
+
+                    elif channel == "futures.trades" and event == "update":
+                        result = msg.get("result", [])
+                        if isinstance(result, dict):
+                            result = [result]
+                        for row in result:
+                            raw_symbol = str(row.get("contract", "")).upper()
+                            if raw_symbol not in GATE_SYMBOLS:
+                                continue
+
                             price = safe_float(row.get("price"))
                             size_raw = safe_float(row.get("size"))
                             ts_ms = int(safe_float(row.get("create_time_ms"), now_ms()))
+
                             if price is None or size_raw is None:
                                 continue
+
+                            # Gate futures 的 size 近期有字段类型升级公告，这里统一转 float 且用绝对值。:contentReference[oaicite:3]{index=3}
                             side = "buy" if size_raw > 0 else "sell"
-                            size = abs(size_raw)
-                            await on_trade("gate", raw_symbol, price, size, side, ts_ms)
+                            size = abs(float(size_raw))
+
+                            await on_trade(
+                                exchange="gate",
+                                raw_symbol=raw_symbol,
+                                price=price,
+                                size=size,
+                                side=side,
+                                ts_ms=ts_ms,
+                            )
 
                     elif channel == "futures.order_book" and event in ("all", "update"):
                         result = msg.get("result", {})
                         raw_symbol = str(result.get("contract", "")).upper()
                         if raw_symbol not in GATE_SYMBOLS:
                             continue
-                        bids = []
-                        asks = []
-                        for x in result.get("bids", [])[:10]:
-                            p = safe_float(x.get("p"))
-                            s = safe_float(x.get("s"))
+
+                        bids: List[Tuple[float, float]] = []
+                        asks: List[Tuple[float, float]] = []
+
+                        for row in result.get("bids", [])[:10]:
+                            if isinstance(row, dict):
+                                p = safe_float(row.get("p"))
+                                s = safe_float(row.get("s"))
+                            elif isinstance(row, list) and len(row) >= 2:
+                                p = safe_float(row[0])
+                                s = safe_float(row[1])
+                            else:
+                                continue
                             if p is not None and s is not None:
-                                bids.append((p, abs(s)))
-                        for x in result.get("asks", [])[:10]:
-                            p = safe_float(x.get("p"))
-                            s = safe_float(x.get("s"))
+                                bids.append((p, abs(float(s))))
+
+                        for row in result.get("asks", [])[:10]:
+                            if isinstance(row, dict):
+                                p = safe_float(row.get("p"))
+                                s = safe_float(row.get("s"))
+                            elif isinstance(row, list) and len(row) >= 2:
+                                p = safe_float(row[0])
+                                s = safe_float(row[1])
+                            else:
+                                continue
                             if p is not None and s is not None:
-                                asks.append((p, abs(s)))
-                        await on_orderbook("gate", raw_symbol, bids, asks, int(safe_float(result.get("t"), now_ms())))
+                                asks.append((p, abs(float(s))))
+
+                        await on_orderbook(
+                            exchange="gate",
+                            raw_symbol=raw_symbol,
+                            bids=bids,
+                            asks=asks,
+                            ts_ms=int(safe_float(result.get("t"), now_ms())),
+                        )
 
                 ping_task.cancel()
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("Gate WS 断开，准备重连: %s", e)
+            logger.warning("Gate WS 断开，5 秒后重连: %s", e)
             await asyncio.sleep(5)
 
 # =========================================================
-# MEXC WS
+# MEXC WebSocket
+# MEXC futures WS 文档提供 edge 地址，且要求客户端周期性发送 ping。:contentReference[oaicite:4]{index=4}
 # =========================================================
 
-async def mexc_ping_loop(ws):
+async def mexc_ping_loop(ws) -> None:
     while True:
         await asyncio.sleep(15)
         try:
@@ -632,13 +701,18 @@ async def mexc_ping_loop(ws):
         except Exception:
             return
 
-async def mexc_ws_loop():
+async def mexc_ws_loop() -> None:
     url = "wss://contract.mexc.com/edge"
 
     while True:
         try:
             logger.info("连接 MEXC WS...")
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=None,
+            ) as ws:
                 for sym in MEXC_SYMBOLS:
                     await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": sym}}))
                     await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": sym}}))
@@ -670,139 +744,123 @@ async def mexc_ws_loop():
                     elif channel == "push.deal":
                         if raw_symbol not in MEXC_SYMBOLS:
                             continue
-                        for row in msg.get("data", []):
+
+                        rows = msg.get("data", [])
+                        if isinstance(rows, dict):
+                            rows = [rows]
+
+                        for row in rows:
                             price = safe_float(row.get("p"))
                             size = safe_float(row.get("v"))
                             ts_ms = int(safe_float(row.get("t"), now_ms()))
                             side_code = row.get("T")
+
                             if price is None or size is None:
                                 continue
-                            side = "buy" if int(side_code) == 1 else "sell"
-                            await on_trade("mexc", raw_symbol, price, abs(size), side, ts_ms)
+
+                            try:
+                                side = "buy" if int(side_code) == 1 else "sell"
+                            except Exception:
+                                side = "unknown"
+
+                            await on_trade(
+                                exchange="mexc",
+                                raw_symbol=raw_symbol,
+                                price=price,
+                                size=abs(float(size)),
+                                side=side,
+                                ts_ms=ts_ms,
+                            )
 
                     elif channel == "push.depth":
                         if raw_symbol not in MEXC_SYMBOLS:
                             continue
+
                         data = msg.get("data", {})
-                        bids = []
-                        asks = []
+                        bids: List[Tuple[float, float]] = []
+                        asks: List[Tuple[float, float]] = []
 
                         for row in data.get("bids", [])[:10]:
                             if isinstance(row, list) and len(row) >= 2:
                                 p = safe_float(row[0])
                                 s = safe_float(row[1])
-                                if p is not None and s is not None:
-                                    bids.append((p, abs(s)))
+                            elif isinstance(row, dict):
+                                p = safe_float(row.get("price"))
+                                s = safe_float(row.get("vol"))
+                            else:
+                                continue
+                            if p is not None and s is not None:
+                                bids.append((p, abs(float(s))))
 
                         for row in data.get("asks", [])[:10]:
                             if isinstance(row, list) and len(row) >= 2:
                                 p = safe_float(row[0])
                                 s = safe_float(row[1])
-                                if p is not None and s is not None:
-                                    asks.append((p, abs(s)))
+                            elif isinstance(row, dict):
+                                p = safe_float(row.get("price"))
+                                s = safe_float(row.get("vol"))
+                            else:
+                                continue
+                            if p is not None and s is not None:
+                                asks.append((p, abs(float(s))))
 
-                        await on_orderbook("mexc", raw_symbol, bids, asks, int(safe_float(msg.get("ts"), now_ms())))
+                        await on_orderbook(
+                            exchange="mexc",
+                            raw_symbol=raw_symbol,
+                            bids=bids,
+                            asks=asks,
+                            ts_ms=int(safe_float(msg.get("ts"), now_ms())),
+                        )
 
                 ping_task.cancel()
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("MEXC WS 断开，准备重连: %s", e)
+            logger.warning("MEXC WS 断开，5 秒后重连: %s", e)
             await asyncio.sleep(5)
 
 # =========================================================
-# Upbit REST: 用于启动前验证实际 USDT 市场
+# FastAPI lifespan
 # =========================================================
 
-async def get_upbit_existing_usdt_markets() -> List[str]:
-    url = f"{UPBIT_REST_BASE}/v1/market/all"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "启动配置 port=%s auto_scan_enabled=%s telegram_enabled=%s watchlist_count=%s",
+        PORT,
+        AUTO_SCAN_ENABLED,
+        TELEGRAM_ENABLED,
+        len(RAW_WATCHLIST),
+    )
+
+    if AUTO_SCAN_ENABLED:
+        if ENABLE_GATE:
+            _bg_tasks.append(asyncio.create_task(gate_ws_loop()))
+        if ENABLE_MEXC:
+            _bg_tasks.append(asyncio.create_task(mexc_ws_loop()))
+        logger.info("已创建 WebSocket 后台任务 count=%s", len(_bg_tasks))
+
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(url, params={"isDetails": "false"})
-            resp.raise_for_status()
-            data = resp.json()
-            out = []
-            if isinstance(data, list):
-                for row in data:
-                    market = str(row.get("market", "")).upper()
-                    if market in UPBIT_SYMBOLS:
-                        out.append(market)
-            return out
-    except Exception as e:
-        logger.warning("Upbit 市场列表获取失败，改为直接订阅全名单: %s", e)
-        return UPBIT_SYMBOLS[:]
+        yield
+    finally:
+        for task in _bg_tasks:
+            task.cancel()
+
+        for task in _bg_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+app = FastAPI(
+    title="Flow Signal Scanner WS",
+    version="5.0.0",
+    lifespan=lifespan,
+)
 
 # =========================================================
-# Upbit WS
-# =========================================================
-
-async def upbit_ws_loop():
-    while True:
-        try:
-            codes = await get_upbit_existing_usdt_markets()
-            logger.info("连接 Upbit WS... 可用市场=%s", len(codes))
-
-            async with websockets.connect(
-                UPBIT_WS_URL,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=None,
-            ) as ws:
-                subscribe_payload = [
-                    {"ticket": f"flow-signal-{int(time.time())}"},
-                    {"type": "trade", "codes": codes, "is_only_realtime": True},
-                    {"type": "orderbook", "codes": codes, "is_only_realtime": True},
-                    {"format": "DEFAULT"},
-                ]
-                await ws.send(json.dumps(subscribe_payload))
-
-                async for raw in ws:
-                    try:
-                        if isinstance(raw, bytes):
-                            msg = json.loads(raw.decode("utf-8"))
-                        else:
-                            msg = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    msg_type = msg.get("type")
-                    raw_symbol = str(msg.get("code", "")).upper()
-                    if raw_symbol not in codes:
-                        continue
-
-                    if msg_type == "trade":
-                        price = safe_float(msg.get("trade_price"))
-                        size = safe_float(msg.get("trade_volume"))
-                        ts_ms = int(safe_float(msg.get("trade_timestamp"), now_ms()))
-                        ask_bid = str(msg.get("ask_bid", "")).upper()
-                        if price is None or size is None:
-                            continue
-                        side = "buy" if ask_bid == "BID" else "sell" if ask_bid == "ASK" else "unknown"
-                        await on_trade("upbit", raw_symbol, price, abs(size), side, ts_ms)
-
-                    elif msg_type == "orderbook":
-                        bids = []
-                        asks = []
-                        for row in msg.get("orderbook_units", [])[:10]:
-                            bid_p = safe_float(row.get("bid_price"))
-                            bid_s = safe_float(row.get("bid_size"))
-                            ask_p = safe_float(row.get("ask_price"))
-                            ask_s = safe_float(row.get("ask_size"))
-                            if bid_p is not None and bid_s is not None:
-                                bids.append((bid_p, abs(bid_s)))
-                            if ask_p is not None and ask_s is not None:
-                                asks.append((ask_p, abs(ask_s)))
-                        await on_orderbook("upbit", raw_symbol, bids, asks, int(safe_float(msg.get("timestamp"), now_ms())))
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("Upbit WS 断开，准备重连: %s", e)
-            await asyncio.sleep(5)
-
-# =========================================================
-# FastAPI
+# API
 # =========================================================
 
 @app.get("/health")
@@ -813,31 +871,41 @@ async def health() -> Dict[str, Any]:
         "auto_scan_enabled": AUTO_SCAN_ENABLED,
         "telegram_enabled": TELEGRAM_ENABLED,
         "watchlist_count": len(RAW_WATCHLIST),
+        "enabled_exchanges": {
+            "gate_futures": ENABLE_GATE,
+            "mexc_futures": ENABLE_MEXC,
+        },
         "state": {
             "market_state": len(market_state),
             "orderbook_state": len(orderbook_state),
             "trade_cache_keys": len(trade_cache),
         },
-        "enabled_exchanges": {
-            "gate_futures": ENABLE_GATE,
-            "mexc_futures": ENABLE_MEXC,
-            "upbit_spot": ENABLE_UPBIT,
-        },
+        "config": {
+            "large_trade_usdt": LARGE_TRADE_USDT,
+            "recent_window_minutes": RECENT_WINDOW_MINUTES,
+            "baseline_window_minutes": BASELINE_WINDOW_MINUTES,
+            "min_recent_notional_usdt": MIN_RECENT_NOTIONAL_USDT,
+            "activity_ratio_threshold": ACTIVITY_RATIO_THRESHOLD,
+            "buy_sell_imbalance_threshold": BUY_SELL_IMBALANCE_THRESHOLD,
+            "large_order_imbalance_threshold": LARGE_ORDER_IMBALANCE_THRESHOLD,
+            "orderbook_imbalance_threshold": ORDERBOOK_IMBALANCE_THRESHOLD,
+            "alert_cooldown_seconds": ALERT_COOLDOWN_SECONDS,
+        }
     }
 
 @app.get("/watchlist")
 async def watchlist() -> Dict[str, Any]:
     return {
+        "count": len(RAW_WATCHLIST),
         "raw_watchlist": RAW_WATCHLIST,
         "gate_symbols": GATE_SYMBOLS,
         "mexc_symbols": MEXC_SYMBOLS,
-        "upbit_symbols": UPBIT_SYMBOLS,
     }
 
 @app.get("/state")
 async def state() -> Dict[str, Any]:
-    sample_markets = list(market_state.items())[:20]
-    sample_orderbooks = list(orderbook_state.items())[:20]
+    sample_markets = dict(list(market_state.items())[:20])
+    sample_orderbooks = dict(list(orderbook_state.items())[:20])
 
     return {
         "generated_at": utc_now_iso(),
@@ -845,8 +913,8 @@ async def state() -> Dict[str, Any]:
         "market_state_count": len(market_state),
         "orderbook_state_count": len(orderbook_state),
         "trade_cache_count": len(trade_cache),
-        "sample_markets": dict(sample_markets),
-        "sample_orderbooks": dict(sample_orderbooks),
+        "sample_markets": sample_markets,
+        "sample_orderbooks": sample_orderbooks,
     }
 
 @app.get("/signals")
@@ -858,9 +926,11 @@ async def signals_preview() -> Dict[str, Any]:
         records = list(trade_cache.get(key, []))
         if not records:
             continue
+
         flow = calc_trade_flow_stats(records, current_ms)
         ob_imbalance = calc_orderbook_imbalance(orderbook_state.get(key))
         signal = build_flow_signal(item, flow, ob_imbalance)
+
         if signal:
             out.append({
                 "exchange": item["exchange"],
@@ -881,45 +951,6 @@ async def signals_preview() -> Dict[str, Any]:
         "signal_count": len(out),
         "signals": out,
     }
-
-# =========================================================
-# 启动 / 关闭
-# =========================================================
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    logger.info(
-        "启动配置 port=%s auto_scan_enabled=%s telegram_enabled=%s watchlist_count=%s",
-        PORT,
-        AUTO_SCAN_ENABLED,
-        TELEGRAM_ENABLED,
-        len(RAW_WATCHLIST),
-    )
-
-    if not AUTO_SCAN_ENABLED:
-        return
-
-    if ENABLE_GATE:
-        _bg_tasks.append(asyncio.create_task(gate_ws_loop()))
-
-    if ENABLE_MEXC:
-        _bg_tasks.append(asyncio.create_task(mexc_ws_loop()))
-
-    if ENABLE_UPBIT:
-        _bg_tasks.append(asyncio.create_task(upbit_ws_loop()))
-
-    logger.info("已创建 WebSocket 后台任务 count=%s", len(_bg_tasks))
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    for task in _bg_tasks:
-        task.cancel()
-
-    for task in _bg_tasks:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
 
 # =========================================================
 # 本地启动
