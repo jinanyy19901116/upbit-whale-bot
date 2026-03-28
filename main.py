@@ -8,21 +8,40 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import httpx
+import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BINANCE_FAPI = "https://fapi.binance.com"
-BYBIT_API = "https://api.bybit.com"
-OKX_API = "https://www.okx.com"
-GATE_API = "https://api.gateio.ws/api/v4"
-MEXC_FUTURES_API = "https://api.mexc.com/api/v1/contract"
+def split_env_list(name: str, default: str) -> List[str]:
+    raw = (os.getenv(name, default) or default).strip()
+    return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
 
-UPBIT_REGION = os.getenv("UPBIT_REGION", "sg")
-UPBIT_API = f"https://{UPBIT_REGION}-api.upbit.com"
+
+def first_nonempty_env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = (os.getenv(name, "") or "").strip()
+        if value:
+            return value
+    return default
+
+
+BINANCE_FAPI_CANDIDATES = split_env_list(
+    "BINANCE_FAPI_URLS",
+    "https://fapi.binance.com,https://fapi1.binance.com,https://fapi2.binance.com",
+)
+BYBIT_API_CANDIDATES = split_env_list(
+    "BYBIT_API_URLS",
+    "https://api.bybit.com,https://api.bytick.com",
+)
+OKX_API = (os.getenv("OKX_API", "https://www.okx.com") or "https://www.okx.com").strip().rstrip("/")
+GATE_API = (os.getenv("GATE_API", "https://api.gateio.ws/api/v4") or "https://api.gateio.ws/api/v4").strip().rstrip("/")
+MEXC_FUTURES_API = (os.getenv("MEXC_FUTURES_API", "https://api.mexc.com/api/v1/contract") or "https://api.mexc.com/api/v1/contract").strip().rstrip("/")
+
+UPBIT_REGION = (os.getenv("UPBIT_REGION", "sg") or "sg").strip().lower()
+UPBIT_API = (os.getenv("UPBIT_API", f"https://{UPBIT_REGION}-api.upbit.com") or f"https://{UPBIT_REGION}-api.upbit.com").strip().rstrip("/")
 
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 DEFAULT_WATCHLIST = os.getenv(
@@ -37,9 +56,9 @@ DEFAULT_WATCHLIST = os.getenv(
 MIN_SIGNAL_TO_ALERT = float(os.getenv("MIN_SIGNAL_TO_ALERT", "55"))
 MIN_EXCHANGES_TO_ALERT = int(os.getenv("MIN_EXCHANGES_TO_ALERT", "2"))
 UPBIT_QUOTE = os.getenv("UPBIT_QUOTE", "USDT")
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
-DATABASE_URL = (os.getenv("DATABASE_URL", "") or "").strip()
+TELEGRAM_BOT_TOKEN = first_nonempty_env("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "BOT_TOKEN")
+TELEGRAM_CHAT_ID = first_nonempty_env("TELEGRAM_CHAT_ID", "TG_CHAT_ID", "CHAT_ID")
+DATABASE_URL = first_nonempty_env("DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL")
 SNAPSHOT_LOOKBACK_MINUTES = int(os.getenv("SNAPSHOT_LOOKBACK_MINUTES", "60"))
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "90"))
 LEADER_LIMIT = int(os.getenv("LEADER_LIMIT", "50"))
@@ -148,6 +167,44 @@ async def fetch_json(
     return resp.json()
 
 
+def is_http_blocked(exc: Exception) -> bool:
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response is not None
+        and exc.response.status_code in {401, 403, 404, 418, 429, 451}
+    )
+
+
+async def fetch_json_with_fallbacks(
+    client: httpx.AsyncClient,
+    base_urls: List[str],
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    exchange_name: str = "exchange",
+) -> Any:
+    last_exc: Optional[Exception] = None
+
+    for base_url in base_urls:
+        url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+        try:
+            data = await fetch_json(client, url, params=params)
+            if base_url != base_urls[0]:
+                logger.warning("%s 已切换到备用接口: %s", exchange_name, base_url)
+            return data
+        except Exception as exc:
+            last_exc = exc
+            if is_http_blocked(exc):
+                status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response else "?"
+                logger.warning("%s 接口受限/不可用 status=%s url=%s", exchange_name, status_code, url)
+                continue
+            logger.exception("%s 接口请求失败 url=%s", exchange_name, url)
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"{exchange_name} 所有接口均不可用")
+
+
 def compute_signal(row: Dict[str, Any], peer_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     volumes = [safe_float(r.get("quote_volume_24h")) for r in peer_rows]
     oi_values = [
@@ -200,7 +257,12 @@ def compute_signal(row: Dict[str, Any], peer_rows: List[Dict[str, Any]]) -> Dict
 
 
 async def get_binance(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict[str, Any]]:
-    tickers = await fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
+    tickers = await fetch_json_with_fallbacks(
+        client,
+        BINANCE_FAPI_CANDIDATES,
+        "/fapi/v1/ticker/24hr",
+        exchange_name="binance",
+    )
     wanted = set(watchlist)
     rows: Dict[str, Dict[str, Any]] = {}
 
@@ -225,7 +287,13 @@ async def get_binance(client: httpx.AsyncClient, watchlist: List[str]) -> List[D
 
     async def enrich(symbol: str) -> None:
         try:
-            oi = await fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/openInterest", params={"symbol": symbol})
+            oi = await fetch_json_with_fallbacks(
+                client,
+                BINANCE_FAPI_CANDIDATES,
+                "/fapi/v1/openInterest",
+                params={"symbol": symbol},
+                exchange_name="binance",
+            )
             contracts = safe_float(oi.get("openInterest"))
             rows[symbol]["open_interest"] = contracts
             rows[symbol]["open_interest_value_usd"] = contracts * rows[symbol]["last_price"]
@@ -237,7 +305,13 @@ async def get_binance(client: httpx.AsyncClient, watchlist: List[str]) -> List[D
 
 
 async def get_bybit(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict[str, Any]]:
-    data = await fetch_json(client, f"{BYBIT_API}/v5/market/tickers", params={"category": "linear"})
+    data = await fetch_json_with_fallbacks(
+        client,
+        BYBIT_API_CANDIDATES,
+        "/v5/market/tickers",
+        params={"category": "linear"},
+        exchange_name="bybit",
+    )
     wanted = set(watchlist)
     rows = []
 
@@ -360,11 +434,25 @@ async def get_mexc(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict
 
 
 async def get_upbit(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict[str, Any]]:
-    markets = [upbit_market(s) for s in watchlist]
+    desired_markets = [upbit_market(s) for s in watchlist]
+
+    try:
+        market_payload = await fetch_json(client, f"{UPBIT_API}/v1/market/all", params={"isDetails": "false"})
+    except Exception:
+        logger.exception("Upbit 市场列表获取失败")
+        return []
+
+    supported_markets = {row.get("market", "") for row in market_payload if isinstance(row, dict)}
+    markets = [market for market in desired_markets if market in supported_markets]
+
+    if not markets:
+        logger.warning("Upbit 当前区域=%s 没有匹配到任何可交易市场 quote=%s", UPBIT_REGION, UPBIT_QUOTE)
+        return []
+
     try:
         data = await fetch_json(client, f"{UPBIT_API}/v1/ticker", params={"markets": ",".join(markets)})
     except Exception:
-        logger.exception("Upbit 数据获取失败")
+        logger.exception("Upbit ticker 获取失败")
         return []
 
     reverse = {upbit_market(s): s for s in watchlist}
@@ -1154,6 +1242,7 @@ async def scan_once(save: bool = True) -> Dict[str, Any]:
         "by_exchange": markets,
         "history_enabled": bool(db.pool),
         "database_configured": bool(DATABASE_URL),
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "database_error": db.last_error,
         "lookback_minutes": SNAPSHOT_LOOKBACK_MINUTES,
     }
@@ -1255,6 +1344,8 @@ async def health() -> Dict[str, Any]:
         "status": "ok",
         "watchlist_count": len(WATCHLIST),
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "telegram_bot_token_present": bool(TELEGRAM_BOT_TOKEN),
+        "telegram_chat_id_present": bool(TELEGRAM_CHAT_ID),
         "database_configured": bool(DATABASE_URL),
         "database_connected": bool(db.pool),
         "database_error": db.last_error,
@@ -1525,24 +1616,16 @@ async def telegram_test(
         "generated_at": utc_now_iso(),
     })
 
-def log_startup_configuration() -> None:
+
+if __name__ == "__main__":
+    host = (os.getenv("HOST", "0.0.0.0") or "0.0.0.0").strip()
     logger.info(
         "启动配置 host=%s port=%s telegram_configured=%s database_configured=%s auto_scan_enabled=%s watchlist_count=%s",
-        "0.0.0.0",
+        host,
         PORT,
         bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         bool(DATABASE_URL),
         AUTO_SCAN_ENABLED,
         len(WATCHLIST),
     )
-
-
-if __name__ == "__main__":
-    log_startup_configuration()
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=False,
-        access_log=True,
-    )
+    uvicorn.run("main:app", host=host, port=PORT, reload=False)
