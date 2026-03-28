@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="资金轮动监控器", version="0.5.0")
+app = FastAPI(title="资金轮动监控器", version="0.7.0")
 
 BINANCE_FAPI = "https://fapi.binance.com"
 BYBIT_API = "https://api.bybit.com"
@@ -43,6 +43,8 @@ DATABASE_URL = (os.getenv("DATABASE_URL", "") or "").strip()
 SNAPSHOT_LOOKBACK_MINUTES = int(os.getenv("SNAPSHOT_LOOKBACK_MINUTES", "60"))
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "90"))
 LEADER_LIMIT = int(os.getenv("LEADER_LIMIT", "50"))
+
+SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
 
 def utc_now() -> datetime:
@@ -109,6 +111,28 @@ def okx_inst_id(usdt_symbol: str) -> str:
 
 def upbit_market(usdt_symbol: str) -> str:
     return f"{UPBIT_QUOTE}-{base_asset(usdt_symbol)}"
+
+
+def validate_interval(interval: str) -> str:
+    v = (interval or "").strip().lower()
+    if v not in SUPPORTED_INTERVALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的 interval={interval}，支持: {sorted(SUPPORTED_INTERVALS)}",
+        )
+    return v
+
+
+def interval_to_seconds(interval: str) -> int:
+    mapping = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14400,
+        "1d": 86400,
+    }
+    return mapping[interval]
 
 
 async def fetch_json(
@@ -376,7 +400,7 @@ def score_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
-    headers = {"User-Agent": "rotation-scanner-cn/0.5.0"}
+    headers = {"User-Agent": "rotation-scanner-cn/0.7.0"}
 
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         tasks = {
@@ -408,7 +432,6 @@ def generate_trade_signal(row: Dict[str, Any]) -> str:
     ex_count = len(row.get("exchanges", []))
     signal_growth = safe_float(row.get("signal_growth_vs_baseline"))
 
-    # 做多买入：多交易所共振 + 放量 + OI上升 + 涨幅还不算太大
     if (
         score >= 60
         and vol >= 20
@@ -418,7 +441,6 @@ def generate_trade_signal(row: Dict[str, Any]) -> str:
     ):
         return "做多买入"
 
-    # 做多观察：有升温迹象，但还没达到强确认
     if (
         score >= 55
         and vol >= 10
@@ -427,7 +449,6 @@ def generate_trade_signal(row: Dict[str, Any]) -> str:
     ):
         return "做多观察"
 
-    # 做空买入：空头方向明显增强，且不是单纯已经跌完
     if (
         score >= 60
         and vol >= 20
@@ -437,7 +458,6 @@ def generate_trade_signal(row: Dict[str, Any]) -> str:
     ):
         return "做空买入"
 
-    # 做空观察：开始转弱，但还没到强确认
     if (
         score >= 55
         and vol >= 10
@@ -446,21 +466,18 @@ def generate_trade_signal(row: Dict[str, Any]) -> str:
     ):
         return "做空观察"
 
-    # 多单止盈：已经大涨，或者上涨后动能开始掉
     if (
         price > 60
         or (price > 35 and (signal_growth < 0 or oi < 0))
     ):
         return "多单止盈"
 
-    # 空单止盈：已经大跌，或者下跌后动能开始掉
     if (
         price < -60
         or (price < -35 and (signal_growth > 0 or oi > 0))
     ):
         return "空单止盈"
 
-    # 止损：信号整体失效
     if (
         score < 40
         or signal_growth <= -8
@@ -586,6 +603,9 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_exchange_time
             ON snapshots(symbol, exchange, snapshot_at DESC);
 
+            CREATE INDEX IF NOT EXISTS idx_snapshots_time
+            ON snapshots(snapshot_at DESC);
+
             CREATE TABLE IF NOT EXISTS alerts_sent (
                 id BIGSERIAL PRIMARY KEY,
                 sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -678,6 +698,284 @@ class Database:
                 VALUES ($1, $2)
                 ON CONFLICT (fingerprint) DO NOTHING
             """, symbol, fingerprint)
+
+    async def get_recent_snapshots(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.pool:
+            return []
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT
+                    id, snapshot_at, exchange, symbol, market_type, last_price,
+                    price_change_pct_24h, quote_volume_24h, base_volume_24h,
+                    high_price_24h, low_price_24h, open_interest,
+                    open_interest_value_usd, funding_rate, signal_score, signal_reason
+                FROM snapshots
+                ORDER BY snapshot_at DESC, id DESC
+                LIMIT $1
+            """, limit)
+
+        return [self._snapshot_row_to_dict(r) for r in rows]
+
+    async def get_symbol_history(
+        self,
+        symbol: str,
+        minutes: int = 1440,
+        exchange: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        if not self.pool:
+            return []
+
+        symbol = symbol.upper().strip()
+
+        async with self.pool.acquire() as conn:
+            if exchange:
+                rows = await conn.fetch("""
+                    SELECT
+                        id, snapshot_at, exchange, symbol, market_type, last_price,
+                        price_change_pct_24h, quote_volume_24h, base_volume_24h,
+                        high_price_24h, low_price_24h, open_interest,
+                        open_interest_value_usd, funding_rate, signal_score, signal_reason
+                    FROM snapshots
+                    WHERE symbol = $1
+                      AND exchange = $2
+                      AND snapshot_at >= NOW() - ($3::text || ' minutes')::interval
+                    ORDER BY snapshot_at ASC, id ASC
+                    LIMIT $4
+                """, symbol, exchange, str(minutes), limit)
+            else:
+                rows = await conn.fetch("""
+                    SELECT
+                        id, snapshot_at, exchange, symbol, market_type, last_price,
+                        price_change_pct_24h, quote_volume_24h, base_volume_24h,
+                        high_price_24h, low_price_24h, open_interest,
+                        open_interest_value_usd, funding_rate, signal_score, signal_reason
+                    FROM snapshots
+                    WHERE symbol = $1
+                      AND snapshot_at >= NOW() - ($2::text || ' minutes')::interval
+                    ORDER BY snapshot_at ASC, id ASC
+                    LIMIT $3
+                """, symbol, str(minutes), limit)
+
+        return [self._snapshot_row_to_dict(r) for r in rows]
+
+    async def get_symbol_history_aggregated(
+        self,
+        symbol: str,
+        minutes: int,
+        interval: str,
+        exchange: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        if not self.pool:
+            return []
+
+        symbol = symbol.upper().strip()
+        bucket_seconds = interval_to_seconds(interval)
+
+        async with self.pool.acquire() as conn:
+            if exchange:
+                rows = await conn.fetch("""
+                    WITH base AS (
+                        SELECT
+                            *,
+                            to_timestamp(floor(extract(epoch from snapshot_at) / $4) * $4) AT TIME ZONE 'UTC' AS bucket_ts
+                        FROM snapshots
+                        WHERE symbol = $1
+                          AND exchange = $2
+                          AND snapshot_at >= NOW() - ($3::text || ' minutes')::interval
+                    ),
+                    agg AS (
+                        SELECT
+                            bucket_ts,
+                            exchange,
+                            symbol,
+                            COUNT(*) AS sample_count,
+                            MIN(last_price) AS low_price,
+                            MAX(last_price) AS high_price,
+                            SUM(COALESCE(quote_volume_24h, 0)) AS volume_sum,
+                            AVG(COALESCE(open_interest_value_usd, 0)) AS oi_value_avg,
+                            AVG(COALESCE(signal_score, 0)) AS signal_score_avg
+                        FROM base
+                        GROUP BY bucket_ts, exchange, symbol
+                    ),
+                    opens AS (
+                        SELECT DISTINCT ON (bucket_ts, exchange, symbol)
+                            bucket_ts, exchange, symbol, last_price AS open_price
+                        FROM base
+                        ORDER BY bucket_ts, exchange, symbol, snapshot_at ASC, id ASC
+                    ),
+                    closes AS (
+                        SELECT DISTINCT ON (bucket_ts, exchange, symbol)
+                            bucket_ts, exchange, symbol, last_price AS close_price
+                        FROM base
+                        ORDER BY bucket_ts, exchange, symbol, snapshot_at DESC, id DESC
+                    )
+                    SELECT
+                        agg.bucket_ts,
+                        agg.exchange,
+                        agg.symbol,
+                        opens.open_price,
+                        agg.high_price,
+                        agg.low_price,
+                        closes.close_price,
+                        agg.volume_sum,
+                        agg.oi_value_avg,
+                        agg.signal_score_avg,
+                        agg.sample_count
+                    FROM agg
+                    JOIN opens USING (bucket_ts, exchange, symbol)
+                    JOIN closes USING (bucket_ts, exchange, symbol)
+                    ORDER BY agg.bucket_ts ASC
+                    LIMIT $5
+                """, symbol, exchange, str(minutes), bucket_seconds, limit)
+            else:
+                rows = await conn.fetch("""
+                    WITH base AS (
+                        SELECT
+                            *,
+                            to_timestamp(floor(extract(epoch from snapshot_at) / $3) * $3) AT TIME ZONE 'UTC' AS bucket_ts
+                        FROM snapshots
+                        WHERE symbol = $1
+                          AND snapshot_at >= NOW() - ($2::text || ' minutes')::interval
+                    ),
+                    agg AS (
+                        SELECT
+                            bucket_ts,
+                            exchange,
+                            symbol,
+                            COUNT(*) AS sample_count,
+                            MIN(last_price) AS low_price,
+                            MAX(last_price) AS high_price,
+                            SUM(COALESCE(quote_volume_24h, 0)) AS volume_sum,
+                            AVG(COALESCE(open_interest_value_usd, 0)) AS oi_value_avg,
+                            AVG(COALESCE(signal_score, 0)) AS signal_score_avg
+                        FROM base
+                        GROUP BY bucket_ts, exchange, symbol
+                    ),
+                    opens AS (
+                        SELECT DISTINCT ON (bucket_ts, exchange, symbol)
+                            bucket_ts, exchange, symbol, last_price AS open_price
+                        FROM base
+                        ORDER BY bucket_ts, exchange, symbol, snapshot_at ASC, id ASC
+                    ),
+                    closes AS (
+                        SELECT DISTINCT ON (bucket_ts, exchange, symbol)
+                            bucket_ts, exchange, symbol, last_price AS close_price
+                        FROM base
+                        ORDER BY bucket_ts, exchange, symbol, snapshot_at DESC, id DESC
+                    )
+                    SELECT
+                        agg.bucket_ts,
+                        agg.exchange,
+                        agg.symbol,
+                        opens.open_price,
+                        agg.high_price,
+                        agg.low_price,
+                        closes.close_price,
+                        agg.volume_sum,
+                        agg.oi_value_avg,
+                        agg.signal_score_avg,
+                        agg.sample_count
+                    FROM agg
+                    JOIN opens USING (bucket_ts, exchange, symbol)
+                    JOIN closes USING (bucket_ts, exchange, symbol)
+                    ORDER BY agg.bucket_ts ASC, agg.exchange ASC
+                    LIMIT $4
+                """, symbol, str(minutes), bucket_seconds, limit)
+
+        out = []
+        for r in rows:
+            out.append({
+                "bucket_at": r["bucket_ts"].replace(tzinfo=timezone.utc).isoformat() if r["bucket_ts"] else None,
+                "exchange": r["exchange"],
+                "symbol": r["symbol"],
+                "open": round(safe_float(r["open_price"]), 8),
+                "high": round(safe_float(r["high_price"]), 8),
+                "low": round(safe_float(r["low_price"]), 8),
+                "close": round(safe_float(r["close_price"]), 8),
+                "volume": round(safe_float(r["volume_sum"]), 2),
+                "open_interest_value_usd": round(safe_float(r["oi_value_avg"]), 2),
+                "avg_signal_score": round(safe_float(r["signal_score_avg"]), 2),
+                "sample_count": int(r["sample_count"] or 0),
+            })
+        return out
+
+    async def get_history_leaders(self, minutes: int = 60, limit: int = 20) -> List[Dict[str, Any]]:
+        if not self.pool:
+            return []
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                WITH latest_per_exchange AS (
+                    SELECT DISTINCT ON (symbol, exchange)
+                        symbol,
+                        exchange,
+                        snapshot_at,
+                        signal_score,
+                        quote_volume_24h,
+                        open_interest_value_usd,
+                        price_change_pct_24h,
+                        signal_reason,
+                        market_type,
+                        last_price
+                    FROM snapshots
+                    WHERE snapshot_at >= NOW() - ($1::text || ' minutes')::interval
+                    ORDER BY symbol, exchange, snapshot_at DESC
+                )
+                SELECT
+                    symbol,
+                    ARRAY_AGG(exchange ORDER BY exchange) AS exchanges,
+                    MAX(signal_score) AS best_signal_score,
+                    AVG(signal_score) AS avg_signal_score_raw,
+                    SUM(COALESCE(quote_volume_24h, 0)) AS quote_volume_24h_sum,
+                    SUM(COALESCE(open_interest_value_usd, 0)) AS open_interest_value_usd_sum,
+                    AVG(COALESCE(price_change_pct_24h, 0)) AS price_change_pct_24h_avg,
+                    ARRAY_AGG(signal_reason ORDER BY exchange) AS reasons,
+                    ARRAY_AGG(market_type ORDER BY exchange) AS market_types,
+                    MAX(snapshot_at) AS latest_snapshot_at
+                FROM latest_per_exchange
+                GROUP BY symbol
+                ORDER BY MAX(signal_score) DESC, SUM(COALESCE(quote_volume_24h, 0)) DESC
+                LIMIT $2
+            """, str(minutes), limit)
+
+        result = []
+        for r in rows:
+            result.append({
+                "symbol": r["symbol"],
+                "exchanges": list(r["exchanges"] or []),
+                "best_signal_score": round(float(r["best_signal_score"] or 0), 2),
+                "avg_signal_score_raw": round(float(r["avg_signal_score_raw"] or 0), 2),
+                "quote_volume_24h_sum": round(float(r["quote_volume_24h_sum"] or 0), 2),
+                "open_interest_value_usd_sum": round(float(r["open_interest_value_usd_sum"] or 0), 2),
+                "price_change_pct_24h_avg": round(float(r["price_change_pct_24h_avg"] or 0), 2),
+                "reasons": [x for x in (r["reasons"] or []) if x],
+                "market_types": sorted(set(x for x in (r["market_types"] or []) if x)),
+                "latest_snapshot_at": r["latest_snapshot_at"].isoformat() if r["latest_snapshot_at"] else None,
+            })
+        return result
+
+    def _snapshot_row_to_dict(self, r: asyncpg.Record) -> Dict[str, Any]:
+        return {
+            "id": int(r["id"]),
+            "snapshot_at": r["snapshot_at"].isoformat() if r["snapshot_at"] else None,
+            "exchange": r["exchange"],
+            "symbol": r["symbol"],
+            "market_type": r["market_type"],
+            "last_price": safe_float(r["last_price"]),
+            "price_change_pct_24h": safe_float(r["price_change_pct_24h"]),
+            "quote_volume_24h": safe_float(r["quote_volume_24h"]),
+            "base_volume_24h": safe_float(r["base_volume_24h"]),
+            "high_price_24h": safe_float(r["high_price_24h"]),
+            "low_price_24h": safe_float(r["low_price_24h"]),
+            "open_interest": safe_float(r["open_interest"]),
+            "open_interest_value_usd": safe_float(r["open_interest_value_usd"]),
+            "funding_rate": safe_float(r["funding_rate"]),
+            "signal_score": safe_float(r["signal_score"]),
+            "signal_reason": r["signal_reason"],
+        }
 
 
 db = Database(DATABASE_URL)
@@ -795,7 +1093,11 @@ async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[b
     }
 
     resp = await client.post(url, json=payload)
-    return resp.is_success, resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw_text": resp.text}
+    return resp.is_success, data
 
 
 def leader_fingerprint(row: Dict[str, Any]) -> str:
@@ -833,6 +1135,21 @@ def build_alert_text(candidates: List[Dict[str, Any]]) -> str:
             f"评分变化={row.get('signal_growth_vs_baseline')}\n"
         )
 
+    return "\n".join(lines)
+
+
+def build_telegram_test_text(note: Optional[str] = None) -> str:
+    lines = [
+        "🧪 Telegram 测试消息",
+        f"应用: {app.title}",
+        f"版本: {app.version}",
+        f"时间: {utc_now_iso()}",
+        f"watchlist_count: {len(WATCHLIST)}",
+        f"database_configured: {bool(DATABASE_URL)}",
+        f"telegram_configured: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}",
+    ]
+    if note:
+        lines.append(f"备注: {note}")
     return "\n".join(lines)
 
 
@@ -881,6 +1198,7 @@ async def root() -> Dict[str, Any]:
         "history_enabled": bool(db.pool),
         "database_configured": bool(DATABASE_URL),
         "supported_exchanges": ["binance", "bybit", "okx", "gate", "mexc", "upbit"],
+        "supported_history_intervals": sorted(SUPPORTED_INTERVALS),
         "endpoints": [
             "/health",
             "/watchlist",
@@ -889,7 +1207,14 @@ async def root() -> Dict[str, Any]:
             "/scan?store=false",
             "/alerts/preview",
             "/alerts/send",
+            "/telegram/test",
+            "/telegram/test?note=hello",
             "/history/status",
+            "/history/latest?limit=200",
+            "/history/symbol?symbol=SIRENUSDT&minutes=1440",
+            "/history/symbol?symbol=SIRENUSDT&minutes=1440&exchange=binance",
+            "/history/symbol?symbol=SIRENUSDT&minutes=1440&interval=5m",
+            "/history/leaders?minutes=60&limit=20",
         ],
         "now": utc_now_iso(),
     }
@@ -933,6 +1258,124 @@ async def history_status() -> Dict[str, Any]:
         "snapshot_count": count,
         "latest_snapshot_at": latest.isoformat() if latest else None,
     }
+
+
+@app.get("/history/latest")
+async def history_latest(
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> JSONResponse:
+    if not db.pool:
+        return JSONResponse({
+            "history_enabled": False,
+            "database_configured": bool(DATABASE_URL),
+            "database_error": db.last_error,
+            "rows": [],
+        })
+
+    rows = await db.get_recent_snapshots(limit=limit)
+    return JSONResponse({
+        "history_enabled": True,
+        "count": len(rows),
+        "limit": limit,
+        "rows": rows,
+    })
+
+
+@app.get("/history/symbol")
+async def history_symbol(
+    symbol: str = Query(..., description="例如 SIRENUSDT"),
+    minutes: int = Query(default=1440, ge=1, le=60 * 24 * 30),
+    exchange: Optional[str] = Query(default=None),
+    interval: Optional[str] = Query(default=None, description="可选: 1m,5m,15m,1h,4h,1d"),
+    limit: int = Query(default=1000, ge=1, le=5000),
+) -> JSONResponse:
+    if not db.pool:
+        return JSONResponse({
+            "history_enabled": False,
+            "database_configured": bool(DATABASE_URL),
+            "database_error": db.last_error,
+            "symbol": symbol.upper().strip(),
+            "exchange": exchange,
+            "rows": [],
+        })
+
+    symbol = symbol.upper().strip()
+    exchange = exchange.lower().strip() if exchange else None
+
+    if interval:
+        interval = validate_interval(interval)
+        rows = await db.get_symbol_history_aggregated(
+            symbol=symbol,
+            minutes=minutes,
+            interval=interval,
+            exchange=exchange,
+            limit=limit,
+        )
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"未找到 {symbol} 的聚合历史数据",
+            )
+        return JSONResponse({
+            "history_enabled": True,
+            "symbol": symbol,
+            "exchange": exchange,
+            "minutes": minutes,
+            "interval": interval,
+            "count": len(rows),
+            "first_bucket_at": rows[0]["bucket_at"],
+            "latest_bucket_at": rows[-1]["bucket_at"],
+            "rows": rows,
+        })
+
+    rows = await db.get_symbol_history(
+        symbol=symbol,
+        minutes=minutes,
+        exchange=exchange,
+        limit=limit,
+    )
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"未找到 {symbol} 的历史快照数据",
+        )
+
+    latest = rows[-1]
+    first = rows[0]
+
+    return JSONResponse({
+        "history_enabled": True,
+        "symbol": symbol,
+        "exchange": exchange,
+        "minutes": minutes,
+        "count": len(rows),
+        "first_snapshot_at": first["snapshot_at"],
+        "latest_snapshot_at": latest["snapshot_at"],
+        "rows": rows,
+    })
+
+
+@app.get("/history/leaders")
+async def history_leaders(
+    minutes: int = Query(default=60, ge=1, le=60 * 24 * 30),
+    limit: int = Query(default=20, ge=1, le=200),
+) -> JSONResponse:
+    if not db.pool:
+        return JSONResponse({
+            "history_enabled": False,
+            "database_configured": bool(DATABASE_URL),
+            "database_error": db.last_error,
+            "rows": [],
+        })
+
+    rows = await db.get_history_leaders(minutes=minutes, limit=limit)
+    return JSONResponse({
+        "history_enabled": True,
+        "minutes": minutes,
+        "count": len(rows),
+        "rows": rows,
+    })
 
 
 @app.get("/scan")
@@ -1038,4 +1481,23 @@ async def alerts_send() -> JSONResponse:
         "generated_at": payload["generated_at"],
         "database_configured": payload["database_configured"],
         "database_error": payload["database_error"],
+    })
+
+
+@app.post("/telegram/test")
+@app.get("/telegram/test")
+async def telegram_test(
+    note: Optional[str] = Query(default=None, description="附加测试备注"),
+) -> JSONResponse:
+    text = build_telegram_test_text(note=note)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
+        ok, telegram_payload = await send_telegram_message(client, text)
+
+    return JSONResponse({
+        "sent": ok,
+        "preview": text,
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "telegram_response": telegram_payload,
+        "generated_at": utc_now_iso(),
     })
