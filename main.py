@@ -53,8 +53,8 @@ RAW_SYMBOLS = [
     "avausdt",
 ]
 
-# 大额成交阈值：200000 USDT
-SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "200000"))
+# 大额成交阈值：100000 USDT
+SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "100000"))
 
 # 同交易所+同合约+同方向 冷却
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "15"))
@@ -318,61 +318,6 @@ class MarketState:
 # =========================
 # CONTRACT CACHES
 # =========================
-class BinanceContractCache:
-    def __init__(self):
-        self.valid_symbols: Set[str] = set()
-        self.available: bool = False
-        self.last_error_status: Optional[int] = None
-        self.session: Optional[aiohttp.ClientSession] = None
-
-    async def start(self):
-        if self.session is None:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-        await self.refresh()
-
-    async def close(self):
-        if self.session:
-            await self.session.close()
-
-    async def refresh(self):
-        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-        try:
-            async with self.session.get(url) as resp:
-                self.last_error_status = resp.status
-                if resp.status != 200:
-                    body = await resp.text()
-                    self.available = False
-                    logger.error("Binance exchangeInfo 拉取失败: %s %s", resp.status, body[:300])
-                    return
-
-                data = await resp.json()
-                symbols = data.get("symbols", [])
-                valid = set()
-
-                for item in symbols:
-                    if not isinstance(item, dict):
-                        continue
-                    sym = str(item.get("symbol", "")).upper()
-                    status = item.get("status")
-                    if sym and status == "TRADING":
-                        valid.add(sym)
-
-                self.valid_symbols = valid
-                self.available = True
-                logger.info("Binance 合约列表已刷新，有效数量: %d", len(valid))
-        except Exception as e:
-            self.available = False
-            logger.exception("Binance 合约列表刷新异常: %s", e)
-
-    async def auto_refresh_loop(self):
-        while True:
-            await asyncio.sleep(CONTRACT_REFRESH_SEC)
-            await self.refresh()
-
-    def is_valid(self, symbol: str) -> bool:
-        return symbol.upper() in self.valid_symbols
-
-
 class GateContractCache:
     def __init__(self):
         self.valid_symbols: Set[str] = set()
@@ -502,12 +447,10 @@ class SnapshotPoller:
     def __init__(
         self,
         market_state: MarketState,
-        binance_cache: BinanceContractCache,
         gate_cache: GateContractCache,
         mexc_cache: MexcContractCache,
     ):
         self.market_state = market_state
-        self.binance_cache = binance_cache
         self.gate_cache = gate_cache
         self.mexc_cache = mexc_cache
         self.session: Optional[aiohttp.ClientSession] = None
@@ -520,67 +463,12 @@ class SnapshotPoller:
         if self.session:
             await self.session.close()
 
-    # ---------- Binance ----------
-    async def _poll_binance_symbol(self, symbol: str):
-        sym = symbol.upper()
-        if not self.binance_cache.available:
-            return
-        if not self.binance_cache.is_valid(sym):
-            return
-
-        try:
-            async with self.session.get(
-                "https://fapi.binance.com/fapi/v1/premiumIndex",
-                params={"symbol": sym},
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    mark_price = safe_float(data.get("markPrice"))
-                    ts_ms = safe_int(
-                        data.get("time"),
-                        int(datetime.now(tz=timezone.utc).timestamp() * 1000),
-                    )
-                    self.market_state.update_price("BINANCE", sym, mark_price, ts_ms)
-        except Exception as e:
-            logger.debug("Binance price 拉取失败 %s: %s", sym, e)
-
-        try:
-            async with self.session.get(
-                "https://fapi.binance.com/fapi/v1/openInterest",
-                params={"symbol": sym},
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    oi_contracts = safe_float(data.get("openInterest"))
-                    ts_ms = safe_int(
-                        data.get("time"),
-                        int(datetime.now(tz=timezone.utc).timestamp() * 1000),
-                    )
-
-                    price_dq = self.market_state.price_history.get(("BINANCE", sym))
-                    if price_dq:
-                        last_price = price_dq[-1][1]
-                        oi_usdt = oi_contracts * last_price
-                        self.market_state.update_oi("BINANCE", sym, oi_usdt, ts_ms)
-        except Exception as e:
-            logger.debug("Binance OI 拉取失败 %s: %s", sym, e)
-
-    async def poll_binance_loop(self, symbols: List[str]):
-        while True:
-            for sym in symbols:
-                try:
-                    await self._poll_binance_symbol(sym)
-                except Exception as e:
-                    logger.debug("Binance snapshot 异常 %s: %s", sym, e)
-            await asyncio.sleep(SNAPSHOT_POLL_SEC)
-
     # ---------- Gate ----------
     async def _poll_gate_symbol(self, unified_symbol: str):
         gate_sym = to_gate_symbol(unified_symbol)
         if not self.gate_cache.is_valid(gate_sym):
             return
 
-        # 价格
         try:
             async with self.session.get(
                 f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{gate_sym}"
@@ -593,7 +481,6 @@ class SnapshotPoller:
         except Exception as e:
             logger.debug("Gate price 拉取失败 %s: %s", gate_sym, e)
 
-        # OI
         try:
             async with self.session.get(
                 "https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
@@ -787,78 +674,6 @@ class LargeTradeDetector:
             self.market_state.get_price_status(ev.exchange, ev.symbol),
             self.market_state.get_oi_status(ev.exchange, ev.symbol),
         )
-
-
-# =========================
-# BINANCE
-# =========================
-class BinanceMonitor:
-    def __init__(self, detector: LargeTradeDetector, market_state: MarketState, symbols: List[str], cache: BinanceContractCache):
-        self.detector = detector
-        self.market_state = market_state
-        self.symbols = symbols
-        self.cache = cache
-
-    def _valid_symbols(self) -> List[str]:
-        if not self.cache.available:
-            logger.warning("Binance 当前不可用（可能是 451/地区限制），本轮跳过 Binance")
-            return []
-
-        valid = []
-        for s in self.symbols:
-            if self.cache.is_valid(s):
-                valid.append(s)
-            else:
-                logger.warning("Binance 不存在该永续合约，已跳过: %s", s)
-        return valid
-
-    async def run(self):
-        while True:
-            try:
-                valid_symbols = self._valid_symbols()
-                if not valid_symbols:
-                    await asyncio.sleep(60)
-                    continue
-
-                streams = "/".join(f"{s.lower()}@aggTrade" for s in valid_symbols)
-                url = f"wss://fstream.binance.com/stream?streams={streams}"
-
-                logger.info("Binance 已连接，有效订阅数: %d", len(valid_symbols))
-                async with websockets.connect(url, ping_interval=150, ping_timeout=30, max_size=2**23) as ws:
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        data = msg.get("data")
-                        if not isinstance(data, dict):
-                            continue
-                        if data.get("e") != "aggTrade":
-                            continue
-
-                        symbol = str(data.get("s", "")).upper()
-                        if not symbol:
-                            continue
-
-                        price = safe_float(data.get("p"))
-                        qty = safe_float(data.get("q"))
-                        notional = price * qty
-                        side = "SELL" if data.get("m", False) else "BUY"
-                        ts_ms = safe_int(data.get("T"), int(time.time() * 1000))
-
-                        self.market_state.update_price("BINANCE", symbol, price, ts_ms)
-
-                        ev = TradeEvent(
-                            exchange="BINANCE",
-                            symbol=symbol,
-                            side=side,
-                            price=price,
-                            qty=qty,
-                            raw_qty=qty,
-                            notional_usdt=notional,
-                            ts_ms=ts_ms,
-                        )
-                        await self.detector.on_trade(ev)
-            except Exception as e:
-                logger.exception("Binance 异常: %s", e)
-                await asyncio.sleep(5)
 
 
 # =========================
@@ -1096,11 +911,9 @@ async def main():
 
     market_state = MarketState()
 
-    binance_cache = BinanceContractCache()
     gate_cache = GateContractCache()
     mexc_cache = MexcContractCache()
 
-    await binance_cache.start()
     await gate_cache.start()
     await mexc_cache.start()
 
@@ -1108,28 +921,24 @@ async def main():
 
     snapshot_poller = SnapshotPoller(
         market_state=market_state,
-        binance_cache=binance_cache,
         gate_cache=gate_cache,
         mexc_cache=mexc_cache,
     )
     await snapshot_poller.start()
 
     monitors = [
-        BinanceMonitor(detector, market_state, USER_SYMBOLS, binance_cache),
         GateMonitor(detector, market_state, USER_SYMBOLS, gate_cache),
         MexcMonitor(detector, market_state, USER_SYMBOLS, mexc_cache),
     ]
 
     logger.info("启动监控币种: %s", ", ".join(USER_SYMBOLS))
-    logger.info("当前启用交易所: BINANCE, GATE, MEXC")
+    logger.info("当前启用交易所: GATE, MEXC")
     logger.info("大单阈值: %.0f USDT", SINGLE_TRADE_USDT)
 
     try:
         await asyncio.gather(
-            binance_cache.auto_refresh_loop(),
             gate_cache.auto_refresh_loop(),
             mexc_cache.auto_refresh_loop(),
-            snapshot_poller.poll_binance_loop(USER_SYMBOLS),
             snapshot_poller.poll_gate_loop(USER_SYMBOLS),
             snapshot_poller.poll_mexc_loop(USER_SYMBOLS),
             *(m.run() for m in monitors),
@@ -1137,7 +946,6 @@ async def main():
     finally:
         await notifier.close()
         await snapshot_poller.close()
-        await binance_cache.close()
         await gate_cache.close()
         await mexc_cache.close()
 
