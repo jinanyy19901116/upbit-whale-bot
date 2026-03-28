@@ -31,11 +31,12 @@ services:
       - .env
     environment:
       TZ: Asia/Singapore
+      PORT: 8080
       DATABASE_URL: postgresql://rotation_user:rotation_pass@postgres:5432/rotation
     ports:
-      - "8000:8000"
+      - "8080:8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 5
