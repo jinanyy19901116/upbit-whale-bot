@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,8 +13,6 @@ from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="资金轮动监控器", version="0.8.0")
 
 BINANCE_FAPI = "https://fapi.binance.com"
 BYBIT_API = "https://api.bybit.com"
@@ -403,7 +402,7 @@ def score_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
-    headers = {"User-Agent": "rotation-scanner-cn/0.8.0"}
+    headers = {"User-Agent": "rotation-scanner-cn/0.8.1"}
 
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         tasks = {
@@ -965,6 +964,28 @@ db = Database(DATABASE_URL)
 background_scan_task: Optional[asyncio.Task] = None
 
 
+async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[bool, Any]:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, {"error": "TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未配置"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        resp = await client.post(url, json=payload)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_text": resp.text}
+        return resp.is_success, data
+    except Exception as e:
+        return False, {"error": f"{type(e).__name__}: {e}"}
+
+
 def leader_fingerprint(row: Dict[str, Any]) -> str:
     exchanges = ",".join(sorted(row["exchanges"]))
     signal = row.get("交易信号", "观望")
@@ -1006,8 +1027,8 @@ def build_alert_text(candidates: List[Dict[str, Any]]) -> str:
 def build_telegram_test_text(note: Optional[str] = None) -> str:
     lines = [
         "🧪 Telegram 测试消息",
-        f"应用: {app.title}",
-        f"版本: {app.version}",
+        f"应用: 资金轮动监控器",
+        f"版本: 0.8.1",
         f"时间: {utc_now_iso()}",
         f"watchlist_count: {len(WATCHLIST)}",
         f"database_configured: {bool(DATABASE_URL)}",
@@ -1101,28 +1122,6 @@ def build_alert_candidates(leaders: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return out[:8]
 
 
-async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[bool, Any]:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, {"error": "TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未配置"}
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-
-    try:
-        resp = await client.post(url, json=payload)
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw_text": resp.text}
-        return resp.is_success, data
-    except Exception as e:
-        return False, {"error": f"{type(e).__name__}: {e}"}
-
-
 async def scan_once(save: bool = True) -> Dict[str, Any]:
     markets = await gather_market_state(WATCHLIST)
 
@@ -1183,8 +1182,8 @@ async def periodic_scan_loop() -> None:
         await asyncio.sleep(max(30, AUTO_SCAN_INTERVAL_SECONDS))
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global background_scan_task
 
     ok = await db.connect()
@@ -1197,10 +1196,7 @@ async def on_startup() -> None:
     else:
         logger.info("自动扫描已关闭")
 
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    global background_scan_task
+    yield
 
     if background_scan_task:
         background_scan_task.cancel()
@@ -1211,6 +1207,13 @@ async def on_shutdown() -> None:
         background_scan_task = None
 
     await db.close()
+
+
+app = FastAPI(
+    title="资金轮动监控器",
+    version="0.8.1",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
