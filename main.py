@@ -10,6 +10,7 @@ import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1523,3 +1524,25 @@ async def telegram_test(
         "telegram_response": telegram_payload,
         "generated_at": utc_now_iso(),
     })
+
+def log_startup_configuration() -> None:
+    logger.info(
+        "启动配置 host=%s port=%s telegram_configured=%s database_configured=%s auto_scan_enabled=%s watchlist_count=%s",
+        "0.0.0.0",
+        PORT,
+        bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        bool(DATABASE_URL),
+        AUTO_SCAN_ENABLED,
+        len(WATCHLIST),
+    )
+
+
+if __name__ == "__main__":
+    log_startup_configuration()
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        reload=False,
+        access_log=True,
+    )
