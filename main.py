@@ -77,11 +77,18 @@ PRICE_FLAT_5M_PCT = float(os.getenv("PRICE_FLAT_5M_PCT", "0.004"))   # 0.4%
 # OI 状态阈值
 OI_FLAT_5M_PCT = float(os.getenv("OI_FLAT_5M_PCT", "0.005"))         # 0.5%
 
-# 合约列表刷新间隔
+# 合约/交易对列表刷新间隔
 CONTRACT_REFRESH_SEC = int(os.getenv("CONTRACT_REFRESH_SEC", "3600"))
 
 # 价格/OI 轮询间隔
 SNAPSHOT_POLL_SEC = int(os.getenv("SNAPSHOT_POLL_SEC", "20"))
+
+# MEXC Spot WS
+MEXC_SPOT_WS_URL = os.getenv("MEXC_SPOT_WS_URL", "wss://wbs-api.mexc.com/ws")
+MEXC_SPOT_STREAM_INTERVAL = os.getenv("MEXC_SPOT_STREAM_INTERVAL", "100ms").strip() or "100ms"
+MEXC_SPOT_MAX_SUBS_PER_CONN = int(os.getenv("MEXC_SPOT_MAX_SUBS_PER_CONN", "30"))
+MEXC_SPOT_PING_SEC = int(os.getenv("MEXC_SPOT_PING_SEC", "15"))
+MEXC_SPOT_RECONNECT_SEC = int(os.getenv("MEXC_SPOT_RECONNECT_SEC", str(23 * 3600 + 50 * 60)))  # 23h50m
 
 # =========================
 # LOGGING
@@ -120,9 +127,8 @@ def to_gate_symbol(sym: str) -> str:
     return f"{base}_USDT"
 
 
-def to_mexc_symbol(sym: str) -> str:
-    base = sym[:-4]
-    return f"{base}_USDT"
+def to_mexc_spot_symbol(sym: str) -> str:
+    return sym.strip().upper()
 
 
 def side_to_cn(side: str) -> str:
@@ -151,6 +157,10 @@ def safe_int(v, default: int = 0) -> int:
         return int(float(v))
     except Exception:
         return default
+
+
+def chunked(items: List[str], size: int) -> List[List[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
 # =========================
@@ -316,7 +326,7 @@ class MarketState:
 
 
 # =========================
-# CONTRACT CACHES
+# CONTRACT / SYMBOL CACHES
 # =========================
 class GateContractCache:
     def __init__(self):
@@ -381,10 +391,9 @@ class GateContractCache:
         return self.multiplier_map.get(symbol.upper(), 1.0)
 
 
-class MexcContractCache:
+class MexcSpotSymbolCache:
     def __init__(self):
         self.valid_symbols: Set[str] = set()
-        self.contract_size_map: Dict[str, float] = {}
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
@@ -397,36 +406,31 @@ class MexcContractCache:
             await self.session.close()
 
     async def refresh(self):
-        url = "https://api.mexc.com/api/v1/contract/detail"
+        url = "https://api.mexc.com/api/v3/exchangeInfo"
         try:
             async with self.session.get(url) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error("MEXC contract detail 拉取失败: %s %s", resp.status, body[:300])
+                    logger.error("MEXC Spot exchangeInfo 拉取失败: %s %s", resp.status, body[:300])
                     return
 
                 payload = await resp.json()
-                items = payload.get("data", [])
+                items = payload.get("symbols", [])
                 valid: Set[str] = set()
-                sizes: Dict[str, float] = {}
 
-                if isinstance(items, dict):
-                    items = [items]
-
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    symbol = str(item.get("symbol") or "").upper()
-                    if not symbol:
-                        continue
-                    valid.add(symbol)
-                    sizes[symbol] = safe_float(item.get("contractSize"), 1.0)
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        symbol = str(item.get("symbol") or "").upper()
+                        if not symbol:
+                            continue
+                        valid.add(symbol)
 
                 self.valid_symbols = valid
-                self.contract_size_map = sizes
-                logger.info("MEXC 合约列表已刷新，有效数量: %d", len(valid))
+                logger.info("MEXC Spot 交易对列表已刷新，有效数量: %d", len(valid))
         except Exception as e:
-            logger.exception("MEXC 合约列表刷新异常: %s", e)
+            logger.exception("MEXC Spot 交易对列表刷新异常: %s", e)
 
     async def auto_refresh_loop(self):
         while True:
@@ -435,9 +439,6 @@ class MexcContractCache:
 
     def is_valid(self, symbol: str) -> bool:
         return symbol.upper() in self.valid_symbols
-
-    def get_contract_size(self, symbol: str) -> float:
-        return self.contract_size_map.get(symbol.upper(), 1.0)
 
 
 # =========================
@@ -448,7 +449,7 @@ class SnapshotPoller:
         self,
         market_state: MarketState,
         gate_cache: GateContractCache,
-        mexc_cache: MexcContractCache,
+        mexc_cache: MexcSpotSymbolCache,
     ):
         self.market_state = market_state
         self.gate_cache = gate_cache
@@ -506,38 +507,26 @@ class SnapshotPoller:
                     logger.debug("Gate snapshot 异常 %s: %s", sym, e)
             await asyncio.sleep(SNAPSHOT_POLL_SEC)
 
-    # ---------- MEXC ----------
+    # ---------- MEXC Spot ----------
     async def _poll_mexc_symbol(self, symbol: str):
-        sym = to_mexc_symbol(symbol)
-        if not self.mexc_cache.is_valid(sym):
+        mexc_sym = to_mexc_spot_symbol(symbol)
+        if not self.mexc_cache.is_valid(mexc_sym):
             return
 
         try:
             async with self.session.get(
-                "https://api.mexc.com/api/v1/contract/ticker",
-                params={"symbol": sym},
+                "https://api.mexc.com/api/v3/ticker/price",
+                params={"symbol": mexc_sym},
             ) as resp:
                 if resp.status == 200:
                     payload = await resp.json()
-                    data = payload.get("data")
-
-                    if isinstance(data, list):
-                        data = data[0] if data else None
-
-                    if isinstance(data, dict):
-                        price = safe_float(data.get("fairPrice") or data.get("lastPrice"))
-                        ts_ms = safe_int(
-                            data.get("timestamp"),
-                            int(datetime.now(tz=timezone.utc).timestamp() * 1000),
-                        )
-                        self.market_state.update_price("MEXC", sym, price, ts_ms)
-
-                        hold_vol = safe_float(data.get("holdVol"))
-                        contract_size = self.mexc_cache.get_contract_size(sym)
-                        oi_usdt = hold_vol * contract_size * price
-                        self.market_state.update_oi("MEXC", sym, oi_usdt, ts_ms)
+                    price = safe_float(payload.get("price"))
+                    ts_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                    self.market_state.update_price("MEXC", mexc_sym, price, ts_ms)
         except Exception as e:
-            logger.debug("MEXC ticker 拉取失败 %s: %s", sym, e)
+            logger.debug("MEXC Spot price 拉取失败 %s: %s", mexc_sym, e)
+
+        # Spot 无 OI，这里不更新 OI，告警中会显示“未知 / N/A”
 
     async def poll_mexc_loop(self, symbols: List[str]):
         while True:
@@ -545,7 +534,7 @@ class SnapshotPoller:
                 try:
                     await self._poll_mexc_symbol(sym)
                 except Exception as e:
-                    logger.debug("MEXC snapshot 异常 %s: %s", sym, e)
+                    logger.debug("MEXC Spot snapshot 异常 %s: %s", sym, e)
             await asyncio.sleep(SNAPSHOT_POLL_SEC)
 
 
@@ -802,10 +791,10 @@ class GateMonitor:
 
 
 # =========================
-# MEXC
+# MEXC SPOT WS
 # =========================
-class MexcMonitor:
-    def __init__(self, detector: LargeTradeDetector, market_state: MarketState, symbols: List[str], cache: MexcContractCache):
+class MexcSpotMonitor:
+    def __init__(self, detector: LargeTradeDetector, market_state: MarketState, symbols: List[str], cache: MexcSpotSymbolCache):
         self.detector = detector
         self.market_state = market_state
         self.symbols = symbols
@@ -814,92 +803,149 @@ class MexcMonitor:
     def _valid_symbols(self) -> List[str]:
         valid = []
         for s in self.symbols:
-            mexc_sym = to_mexc_symbol(s)
+            mexc_sym = to_mexc_spot_symbol(s)
             if self.cache.is_valid(mexc_sym):
                 valid.append(mexc_sym)
             else:
-                logger.warning("MEXC 不存在该永续合约，已跳过: %s -> %s", s, mexc_sym)
+                logger.warning("MEXC Spot 不存在该交易对，已跳过: %s", mexc_sym)
         return valid
+
+    @staticmethod
+    def _build_topic(symbol: str) -> str:
+        return f"spot@public.aggre.deals.v3.api.pb@{MEXC_SPOT_STREAM_INTERVAL}@{symbol}"
 
     async def _ping_loop(self, ws):
         while True:
             try:
-                await asyncio.sleep(15)
-                await ws.send(json.dumps({"method": "ping"}))
+                await asyncio.sleep(MEXC_SPOT_PING_SEC)
+                await ws.send(json.dumps({"method": "PING"}))
             except Exception:
                 return
 
-    async def run(self):
-        url = "wss://contract.mexc.com/edge"
+    async def _ttl_loop(self, ws):
+        try:
+            await asyncio.sleep(MEXC_SPOT_RECONNECT_SEC)
+            await ws.close()
+        except Exception:
+            return
 
+    async def _handle_message(self, raw):
+        try:
+            if isinstance(raw, bytes):
+                # 这里按 text/json 先尝试；如果服务端实际返回 protobuf 二进制帧，
+                # 该帧会被跳过并记录 debug 日志。
+                try:
+                    raw = raw.decode("utf-8")
+                except Exception:
+                    logger.debug("MEXC Spot 收到二进制帧，当前代码未做 protobuf 解码，已跳过")
+                    return
+
+            msg = json.loads(raw)
+        except Exception:
+            logger.debug("MEXC Spot 消息解析失败")
+            return
+
+        if not isinstance(msg, dict):
+            return
+
+        # 订阅确认 / pong
+        if "code" in msg and "msg" in msg:
+            if str(msg.get("msg", "")).upper() == "PONG":
+                return
+            code = safe_int(msg.get("code"), -1)
+            if code == 0:
+                logger.debug("MEXC Spot 订阅成功: %s", msg.get("msg"))
+            else:
+                logger.warning("MEXC Spot 响应异常: %s", msg)
+            return
+
+        channel = str(msg.get("channel", ""))
+        symbol = str(msg.get("symbol", "")).upper()
+        publicdeals = msg.get("publicdeals")
+
+        if not channel.startswith("spot@public.aggre.deals.v3.api.pb@"):
+            return
+        if not symbol or not isinstance(publicdeals, dict):
+            return
+
+        deals_list = publicdeals.get("dealsList", [])
+        if not isinstance(deals_list, list):
+            return
+
+        for item in deals_list:
+            if not isinstance(item, dict):
+                continue
+
+            price = safe_float(item.get("price"))
+            qty = safe_float(item.get("quantity"))
+            ts_ms = safe_int(item.get("time"), int(time.time() * 1000))
+            trade_type = safe_int(item.get("tradetype"), 0)
+            side = "BUY" if trade_type == 1 else "SELL"
+            notional = price * qty
+
+            if price <= 0 or qty <= 0:
+                continue
+
+            self.market_state.update_price("MEXC", symbol, price, ts_ms)
+
+            ev = TradeEvent(
+                exchange="MEXC",
+                symbol=symbol,
+                side=side,
+                price=price,
+                qty=qty,
+                raw_qty=qty,
+                notional_usdt=notional,
+                ts_ms=ts_ms,
+            )
+            await self.detector.on_trade(ev)
+
+    async def _run_one_connection(self, sub_symbols: List[str], conn_index: int):
         while True:
             try:
-                valid_symbols = self._valid_symbols()
-                if not valid_symbols:
-                    logger.warning("MEXC 没有可订阅的有效合约，60秒后重试")
-                    await asyncio.sleep(60)
-                    continue
+                topics = [self._build_topic(s) for s in sub_symbols]
 
-                logger.info("MEXC 已连接，有效订阅数: %d", len(valid_symbols))
-                async with websockets.connect(url, ping_interval=None, ping_timeout=None, max_size=2**23) as ws:
+                logger.info(
+                    "MEXC Spot 已连接，连接 #%d，有效订阅数: %d",
+                    conn_index,
+                    len(topics),
+                )
+
+                async with websockets.connect(
+                    MEXC_SPOT_WS_URL,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    max_size=2**23,
+                ) as ws:
                     ping_task = asyncio.create_task(self._ping_loop(ws))
+                    ttl_task = asyncio.create_task(self._ttl_loop(ws))
                     try:
-                        for sym in valid_symbols:
-                            await ws.send(json.dumps({
-                                "method": "sub.deal",
-                                "param": {"symbol": sym},
-                            }))
+                        await ws.send(json.dumps({
+                            "method": "SUBSCRIPTION",
+                            "params": topics,
+                        }))
 
                         async for raw in ws:
-                            msg = json.loads(raw)
-                            if not isinstance(msg, dict):
-                                continue
-
-                            channel = msg.get("channel")
-                            if channel == "pong":
-                                continue
-                            if channel != "push.deal":
-                                continue
-
-                            symbol = str(msg.get("symbol", "")).upper()
-                            data = msg.get("data", [])
-                            if not symbol or not isinstance(data, list):
-                                continue
-
-                            contract_size = self.cache.get_contract_size(symbol)
-
-                            for item in data:
-                                if not isinstance(item, dict):
-                                    continue
-
-                                price = safe_float(item.get("p"))
-                                contracts = safe_float(item.get("v"))
-                                qty_coin = contracts * contract_size
-                                notional = price * qty_coin
-
-                                t_side = safe_int(item.get("T"), 0)
-                                side = "BUY" if t_side == 1 else "SELL"
-                                ts_ms = safe_int(item.get("t"), int(time.time() * 1000))
-
-                                self.market_state.update_price("MEXC", symbol, price, ts_ms)
-
-                                ev = TradeEvent(
-                                    exchange="MEXC",
-                                    symbol=symbol,
-                                    side=side,
-                                    price=price,
-                                    qty=qty_coin,
-                                    raw_qty=contracts,
-                                    contract_multiplier=contract_size,
-                                    notional_usdt=notional,
-                                    ts_ms=ts_ms,
-                                )
-                                await self.detector.on_trade(ev)
+                            await self._handle_message(raw)
                     finally:
                         ping_task.cancel()
+                        ttl_task.cancel()
+
             except Exception as e:
-                logger.exception("MEXC 异常: %s", e)
+                logger.exception("MEXC Spot WS 异常（连接 #%d）: %s", conn_index, e)
                 await asyncio.sleep(5)
+
+    async def run(self):
+        valid_symbols = self._valid_symbols()
+        if not valid_symbols:
+            while True:
+                logger.warning("MEXC Spot 没有可订阅的有效交易对，60秒后重试")
+                await asyncio.sleep(60)
+
+        groups = chunked(valid_symbols, MEXC_SPOT_MAX_SUBS_PER_CONN)
+        await asyncio.gather(
+            *(self._run_one_connection(group, idx + 1) for idx, group in enumerate(groups))
+        )
 
 
 # =========================
@@ -912,7 +958,7 @@ async def main():
     market_state = MarketState()
 
     gate_cache = GateContractCache()
-    mexc_cache = MexcContractCache()
+    mexc_cache = MexcSpotSymbolCache()
 
     await gate_cache.start()
     await mexc_cache.start()
@@ -928,12 +974,13 @@ async def main():
 
     monitors = [
         GateMonitor(detector, market_state, USER_SYMBOLS, gate_cache),
-        MexcMonitor(detector, market_state, USER_SYMBOLS, mexc_cache),
+        MexcSpotMonitor(detector, market_state, USER_SYMBOLS, mexc_cache),
     ]
 
     logger.info("启动监控币种: %s", ", ".join(USER_SYMBOLS))
-    logger.info("当前启用交易所: GATE, MEXC")
+    logger.info("当前启用交易所: GATE, MEXC-SPOT")
     logger.info("大单阈值: %.0f USDT", SINGLE_TRADE_USDT)
+    logger.info("MEXC Spot WS: %s", MEXC_SPOT_WS_URL)
 
     try:
         await asyncio.gather(
