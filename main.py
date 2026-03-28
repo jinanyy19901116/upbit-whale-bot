@@ -1,5 +1,5 @@
-
 import asyncio
+import logging
 import math
 import os
 from datetime import datetime, timezone
@@ -10,27 +10,36 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Watchlist Rotation Scanner", version="0.3.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Watchlist Rotation Scanner", version="0.3.1")
 
 BINANCE_FAPI = "https://fapi.binance.com"
 BYBIT_API = "https://api.bybit.com"
 OKX_API = "https://www.okx.com"
 GATE_API = "https://api.gateio.ws/api/v4"
 MEXC_FUTURES_API = "https://api.mexc.com/api/v1/contract"
+
 UPBIT_REGION = os.getenv("UPBIT_REGION", "sg")
 UPBIT_API = f"https://{UPBIT_REGION}-api.upbit.com"
 
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 DEFAULT_WATCHLIST = os.getenv(
     "WATCHLIST",
-    "SIGNUSDT,KITEUSDT,HYPEUSDT,SIRENUSDT,PHAUSDT,POWERUSDT,SKYAIUSDT,BARDUSDT,QUSDT,UAIUSDT,HUSDT,ICXUSDT,ROBOUSDT,OGNUSDT,XAIUSDT,IPUSDT,XAGUSDT,GUSDT,ANKRUSDT,ANIMEUSDT,BANUSDT,GUNUSDT,ZROUSDT,CUSDT,LIGHTUSDT,CVCUSDT,AVAUSDT",
+    (
+        "SIGNUSDT,KITEUSDT,HYPEUSDT,SIRENUSDT,PHAUSDT,POWERUSDT,SKYAIUSDT,"
+        "BARDUSDT,QUSDT,UAIUSDT,HUSDT,ICXUSDT,ROBOUSDT,OGNUSDT,XAIUSDT,IPUSDT,"
+        "XAGUSDT,GUSDT,ANKRUSDT,ANIMEUSDT,BANUSDT,GUNUSDT,ZROUSDT,CUSDT,"
+        "LIGHTUSDT,CVCUSDT,AVAUSDT"
+    ),
 )
 MIN_SIGNAL_TO_ALERT = float(os.getenv("MIN_SIGNAL_TO_ALERT", "55"))
 MIN_EXCHANGES_TO_ALERT = int(os.getenv("MIN_EXCHANGES_TO_ALERT", "2"))
 UPBIT_QUOTE = os.getenv("UPBIT_QUOTE", "USDT")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+DATABASE_URL = (os.getenv("DATABASE_URL", "") or "").strip()
 SNAPSHOT_LOOKBACK_MINUTES = int(os.getenv("SNAPSHOT_LOOKBACK_MINUTES", "60"))
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "90"))
 LEADER_LIMIT = int(os.getenv("LEADER_LIMIT", "50"))
@@ -102,7 +111,11 @@ def upbit_market(usdt_symbol: str) -> str:
     return f"{UPBIT_QUOTE}-{base_asset(usdt_symbol)}"
 
 
-async def fetch_json(client: httpx.AsyncClient, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+async def fetch_json(
+    client: httpx.AsyncClient,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Any:
     resp = await client.get(url, params=params)
     resp.raise_for_status()
     return resp.json()
@@ -110,7 +123,11 @@ async def fetch_json(client: httpx.AsyncClient, url: str, params: Optional[Dict[
 
 def compute_signal(row: Dict[str, Any], peer_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     volumes = [safe_float(r.get("quote_volume_24h")) for r in peer_rows]
-    oi_values = [safe_float(r.get("open_interest_value_usd")) for r in peer_rows if r.get("open_interest_value_usd") is not None]
+    oi_values = [
+        safe_float(r.get("open_interest_value_usd"))
+        for r in peer_rows
+        if r.get("open_interest_value_usd") is not None
+    ]
     changes = [safe_float(r.get("price_change_pct_24h")) for r in peer_rows]
 
     price_move = safe_float(row.get("price_change_pct_24h"))
@@ -159,6 +176,7 @@ async def get_binance(client: httpx.AsyncClient, watchlist: List[str]) -> List[D
     tickers = await fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
     wanted = set(watchlist)
     rows: Dict[str, Dict[str, Any]] = {}
+
     for t in tickers:
         symbol = t.get("symbol", "")
         if symbol not in wanted:
@@ -178,14 +196,14 @@ async def get_binance(client: httpx.AsyncClient, watchlist: List[str]) -> List[D
             "funding_rate": None,
         }
 
-    async def enrich(symbol: str):
+    async def enrich(symbol: str) -> None:
         try:
             oi = await fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/openInterest", params={"symbol": symbol})
             contracts = safe_float(oi.get("openInterest"))
             rows[symbol]["open_interest"] = contracts
             rows[symbol]["open_interest_value_usd"] = contracts * rows[symbol]["last_price"]
         except Exception:
-            pass
+            logger.exception("Binance OI fetch failed for %s", symbol)
 
     await asyncio.gather(*(enrich(symbol) for symbol in rows.keys()))
     return list(rows.values())
@@ -195,6 +213,7 @@ async def get_bybit(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dic
     data = await fetch_json(client, f"{BYBIT_API}/v5/market/tickers", params={"category": "linear"})
     wanted = set(watchlist)
     rows = []
+
     for t in data.get("result", {}).get("list", []):
         symbol = t.get("symbol", "")
         if symbol not in wanted:
@@ -220,6 +239,7 @@ async def get_okx(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict[
     data = await fetch_json(client, f"{OKX_API}/api/v5/market/tickers", params={"instType": "SWAP"})
     wanted = {okx_inst_id(s): s for s in watchlist}
     rows: Dict[str, Dict[str, Any]] = {}
+
     for t in data.get("data", []):
         inst_id = t.get("instId", "")
         if inst_id not in wanted:
@@ -240,15 +260,19 @@ async def get_okx(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict[
             "funding_rate": None,
         }
 
-    async def enrich(symbol: str):
+    async def enrich(symbol: str) -> None:
         try:
-            payload = await fetch_json(client, f"{OKX_API}/api/v5/public/open-interest", params={"instId": okx_inst_id(symbol)})
+            payload = await fetch_json(
+                client,
+                f"{OKX_API}/api/v5/public/open-interest",
+                params={"instId": okx_inst_id(symbol)},
+            )
             if payload.get("data"):
                 oi_row = payload["data"][0]
                 rows[symbol]["open_interest"] = safe_float(oi_row.get("oi"))
                 rows[symbol]["open_interest_value_usd"] = safe_float(oi_row.get("oiCcy"))
         except Exception:
-            pass
+            logger.exception("OKX OI fetch failed for %s", symbol)
 
     await asyncio.gather(*(enrich(symbol) for symbol in rows.keys()))
     return list(rows.values())
@@ -258,6 +282,7 @@ async def get_gate(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict
     data = await fetch_json(client, f"{GATE_API}/spot/tickers")
     wanted = {gate_pair(s): s for s in watchlist}
     rows = []
+
     for t in data:
         pair = t.get("currency_pair", "")
         if pair not in wanted:
@@ -283,6 +308,7 @@ async def get_mexc(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict
     data = await fetch_json(client, f"{MEXC_FUTURES_API}/ticker")
     wanted = {mexc_symbol(s): s for s in watchlist}
     rows = []
+
     for t in data.get("data", []):
         symbol_key = t.get("symbol", "")
         if symbol_key not in wanted:
@@ -311,9 +337,12 @@ async def get_upbit(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dic
     try:
         data = await fetch_json(client, f"{UPBIT_API}/v1/ticker", params={"markets": ",".join(markets)})
     except Exception:
+        logger.exception("Upbit fetch failed")
         return []
+
     reverse = {upbit_market(s): s for s in watchlist}
     rows = []
+
     for t in data:
         market = t.get("market", "")
         if market not in reverse:
@@ -347,7 +376,8 @@ def score_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
-    headers = {"User-Agent": "watchlist-rotation-scanner/0.3"}
+    headers = {"User-Agent": "watchlist-rotation-scanner/0.3.1"}
+
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         tasks = {
             "binance": get_binance(client, watchlist),
@@ -362,14 +392,17 @@ async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, 
     markets: Dict[str, List[Dict[str, Any]]] = {}
     for name, payload in zip(tasks.keys(), raw_results):
         if isinstance(payload, Exception):
+            logger.exception("Exchange fetch failed for %s: %s", name, payload)
             markets[name] = []
         else:
             markets[name] = score_rows(payload)
+
     return markets
 
 
 def build_cross_exchange_summary(markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     merged: Dict[str, Dict[str, Any]] = {}
+
     for ex, rows in markets.items():
         for row in rows:
             symbol = row["symbol"]
@@ -397,10 +430,13 @@ def build_cross_exchange_summary(markets: Dict[str, List[Dict[str, Any]]]) -> Li
         n = len(item["exchanges"])
         if n:
             item["avg_signal_score"] = round(
-                item["best_signal_score"] * 0.55 + min(n, 6) * 7 + math.log10(item["quote_volume_24h_sum"] + 1) * 2.3,
+                item["best_signal_score"] * 0.55
+                + min(n, 6) * 7
+                + math.log10(item["quote_volume_24h_sum"] + 1) * 2.3,
                 2,
             )
             item["price_change_pct_24h_avg"] = round(item["price_change_pct_24h_avg"] / n, 2)
+
         item["quote_volume_24h_sum"] = round(item["quote_volume_24h_sum"], 2)
         item["open_interest_value_usd_sum"] = round(item["open_interest_value_usd_sum"], 2)
         item["market_types"] = sorted(set(mt for mt in item["market_types"] if mt))
@@ -413,15 +449,44 @@ def build_cross_exchange_summary(markets: Dict[str, List[Dict[str, Any]]]) -> Li
 
 class Database:
     def __init__(self, dsn: str):
-        self.dsn = dsn
+        self.dsn = (dsn or "").strip()
         self.pool: Optional[asyncpg.Pool] = None
+        self.enabled: bool = bool(self.dsn)
+        self.last_error: Optional[str] = None
 
-    async def connect(self) -> None:
+    async def connect(self) -> bool:
         if not self.dsn:
-            return
-        if self.pool is None:
-            self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=4)
+            self.enabled = False
+            self.last_error = "DATABASE_URL is empty"
+            logger.warning("Database disabled: DATABASE_URL is empty.")
+            return False
+
+        if self.pool is not None:
+            return True
+
+        try:
+            self.pool = await asyncpg.create_pool(
+                dsn=self.dsn,
+                min_size=1,
+                max_size=4,
+                timeout=10,
+            )
             await self.init_schema()
+            self.enabled = True
+            self.last_error = None
+            logger.info("Database connected successfully.")
+            return True
+        except Exception as e:
+            self.pool = None
+            self.enabled = False
+            self.last_error = f"{type(e).__name__}: {e}"
+            logger.exception("Database connection failed.")
+            return False
+
+    async def reconnect(self) -> bool:
+        await self.close()
+        await asyncio.sleep(1)
+        return await self.connect()
 
     async def close(self) -> None:
         if self.pool:
@@ -451,6 +516,7 @@ class Database:
                 signal_score DOUBLE PRECISION,
                 signal_reason TEXT
             );
+
             CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_exchange_time
             ON snapshots(symbol, exchange, snapshot_at DESC);
 
@@ -465,6 +531,7 @@ class Database:
     async def insert_snapshots(self, markets: Dict[str, List[Dict[str, Any]]]) -> int:
         if not self.pool:
             return 0
+
         rows = []
         for _, items in markets.items():
             for r in items:
@@ -484,8 +551,10 @@ class Database:
                     r.get("signal_score"),
                     r.get("signal_reason"),
                 ))
+
         if not rows:
             return 0
+
         async with self.pool.acquire() as conn:
             await conn.executemany("""
                 INSERT INTO snapshots (
@@ -494,11 +563,13 @@ class Database:
                     funding_rate, signal_score, signal_reason
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             """, rows)
+
         return len(rows)
 
     async def get_baseline(self, minutes: int) -> Dict[Tuple[str, str], Dict[str, float]]:
         if not self.pool:
             return {}
+
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT DISTINCT ON (symbol, exchange)
@@ -507,23 +578,26 @@ class Database:
                 WHERE snapshot_at <= NOW() - ($1::text || ' minutes')::interval
                 ORDER BY symbol, exchange, snapshot_at DESC
             """, str(minutes))
-        out = {}
+
+        out: Dict[Tuple[str, str], Dict[str, float]] = {}
         for r in rows:
             out[(r["symbol"], r["exchange"])] = {
-                "quote_volume_24h": safe_float(r["quote_volume_24h"]),
-                "open_interest_value_usd": safe_float(r["open_interest_value_usd"]),
-                "signal_score": safe_float(r["signal_score"]),
+                "quote_volume_24h": float(r["quote_volume_24h"] or 0),
+                "open_interest_value_usd": float(r["open_interest_value_usd"] or 0),
+                "signal_score": float(r["signal_score"] or 0),
             }
         return out
 
     async def recently_alerted(self, fingerprint: str, cooldown_minutes: int) -> bool:
         if not self.pool:
             return False
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT 1
                 FROM alerts_sent
-                WHERE fingerprint = $1 AND sent_at >= NOW() - ($2::text || ' minutes')::interval
+                WHERE fingerprint = $1
+                  AND sent_at >= NOW() - ($2::text || ' minutes')::interval
                 LIMIT 1
             """, fingerprint, str(cooldown_minutes))
             return bool(row)
@@ -531,6 +605,7 @@ class Database:
     async def mark_alert_sent(self, symbol: str, fingerprint: str) -> None:
         if not self.pool:
             return
+
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO alerts_sent (symbol, fingerprint)
@@ -544,7 +619,9 @@ db = Database(DATABASE_URL)
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    await db.connect()
+    ok = await db.connect()
+    if not ok:
+        logger.warning("Database unavailable. App continues without Postgres. error=%s", db.last_error)
 
 
 @app.on_event("shutdown")
@@ -552,7 +629,11 @@ async def on_shutdown() -> None:
     await db.close()
 
 
-def enrich_with_history(leaders: List[Dict[str, Any]], baseline: Dict[Tuple[str, str], Dict[str, float]], markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+def enrich_with_history(
+    leaders: List[Dict[str, Any]],
+    baseline: Dict[Tuple[str, str], Dict[str, float]],
+    markets: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
     current_map = {}
     for ex, rows in markets.items():
         for row in rows:
@@ -562,11 +643,13 @@ def enrich_with_history(leaders: List[Dict[str, Any]], baseline: Dict[Tuple[str,
         vol_growth = []
         oi_growth = []
         score_growth = []
+
         for ex in leader["exchanges"]:
             curr = current_map.get((leader["symbol"], ex))
             prev = baseline.get((leader["symbol"], ex))
             if not curr or not prev:
                 continue
+
             prev_vol = safe_float(prev.get("quote_volume_24h"))
             curr_vol = safe_float(curr.get("quote_volume_24h"))
             prev_oi = safe_float(prev.get("open_interest_value_usd"))
@@ -585,14 +668,16 @@ def enrich_with_history(leaders: List[Dict[str, Any]], baseline: Dict[Tuple[str,
         leader["oi_growth_pct_vs_baseline"] = round(sum(oi_growth) / len(oi_growth), 2) if oi_growth else None
         leader["signal_growth_vs_baseline"] = round(sum(score_growth) / len(score_growth), 2) if score_growth else None
 
-        reasons = []
+        flags = []
         if leader.get("volume_growth_pct_vs_baseline") is not None and leader["volume_growth_pct_vs_baseline"] >= 20:
-            reasons.append("量能抬升")
+            flags.append("量能抬升")
         if leader.get("oi_growth_pct_vs_baseline") is not None and leader["oi_growth_pct_vs_baseline"] >= 10:
-            reasons.append("OI扩张")
+            flags.append("OI扩张")
         if leader.get("signal_growth_vs_baseline") is not None and leader["signal_growth_vs_baseline"] >= 6:
-            reasons.append("评分加速")
-        leader["historical_flags"] = reasons
+            flags.append("评分加速")
+
+        leader["historical_flags"] = flags
+
     return leaders
 
 
@@ -608,6 +693,7 @@ def build_alert_candidates(leaders: List[Dict[str, Any]]) -> List[Dict[str, Any]
         )
         if strong and multi_ex and improving:
             out.append(row)
+
     out.sort(key=lambda x: (x["avg_signal_score"], len(x["exchanges"])), reverse=True)
     return out[:8]
 
@@ -615,12 +701,14 @@ def build_alert_candidates(leaders: List[Dict[str, Any]]) -> List[Dict[str, Any]
 async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[bool, Any]:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False, {"error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing"}
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "disable_web_page_preview": True,
     }
+
     resp = await client.post(url, json=payload)
     return resp.is_success, resp.json()
 
@@ -634,24 +722,39 @@ def leader_fingerprint(row: Dict[str, Any]) -> str:
 def build_alert_text(candidates: List[Dict[str, Any]]) -> str:
     if not candidates:
         return ""
+
     lines = [f"🚨 Rotation Scanner Alert {utc_now_iso()}"]
     for row in candidates:
         flags = ",".join(row.get("historical_flags") or [])
         lines.append(
             f"- {row['symbol']} | score={row['avg_signal_score']} | ex={','.join(row['exchanges'])} | "
             f"chg24h={row['price_change_pct_24h_avg']}% | vol24h=${row['quote_volume_24h_sum']:,.0f} | "
-            f"volΔ={row.get('volume_growth_pct_vs_baseline')}% | oiΔ={row.get('oi_growth_pct_vs_baseline')}% | flags={flags}"
+            f"volΔ={row.get('volume_growth_pct_vs_baseline')}% | oiΔ={row.get('oi_growth_pct_vs_baseline')}% | "
+            f"flags={flags}"
         )
     return "\n".join(lines)
 
 
 async def scan_once(save: bool = True) -> Dict[str, Any]:
     markets = await gather_market_state(WATCHLIST)
-    if save and DATABASE_URL:
-        await db.insert_snapshots(markets)
+
+    if save and db.pool:
+        try:
+            await db.insert_snapshots(markets)
+        except Exception as e:
+            db.last_error = f"{type(e).__name__}: {e}"
+            logger.exception("Insert snapshots failed")
 
     leaders = build_cross_exchange_summary(markets)
-    baseline = await db.get_baseline(SNAPSHOT_LOOKBACK_MINUTES) if DATABASE_URL else {}
+
+    baseline = {}
+    if db.pool:
+        try:
+            baseline = await db.get_baseline(SNAPSHOT_LOOKBACK_MINUTES)
+        except Exception as e:
+            db.last_error = f"{type(e).__name__}: {e}"
+            logger.exception("Get baseline failed")
+
     leaders = enrich_with_history(leaders, baseline, markets)
     candidates = build_alert_candidates(leaders)
 
@@ -661,7 +764,9 @@ async def scan_once(save: bool = True) -> Dict[str, Any]:
         "leaders_cross_exchange": leaders,
         "alert_candidates": candidates,
         "by_exchange": markets,
-        "history_enabled": bool(DATABASE_URL),
+        "history_enabled": bool(db.pool),
+        "database_configured": bool(DATABASE_URL),
+        "database_error": db.last_error,
         "lookback_minutes": SNAPSHOT_LOOKBACK_MINUTES,
     }
 
@@ -672,11 +777,18 @@ async def root() -> Dict[str, Any]:
         "name": app.title,
         "version": app.version,
         "watchlist_count": len(WATCHLIST),
-        "history_enabled": bool(DATABASE_URL),
+        "history_enabled": bool(db.pool),
+        "database_configured": bool(DATABASE_URL),
         "supported_exchanges": ["binance", "bybit", "okx", "gate", "mexc", "upbit"],
         "endpoints": [
-            "/health", "/watchlist", "/scan", "/scan?symbol=SIRENUSDT", "/scan/store=false",
-            "/alerts/preview", "/alerts/send", "/history/status"
+            "/health",
+            "/watchlist",
+            "/scan",
+            "/scan?symbol=SIRENUSDT",
+            "/scan?store=false",
+            "/alerts/preview",
+            "/alerts/send",
+            "/history/status",
         ],
         "now": utc_now_iso(),
     }
@@ -688,7 +800,9 @@ async def health() -> Dict[str, Any]:
         "status": "ok",
         "watchlist_count": len(WATCHLIST),
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
-        "history_enabled": bool(DATABASE_URL),
+        "database_configured": bool(DATABASE_URL),
+        "database_connected": bool(db.pool),
+        "database_error": db.last_error,
         "upbit_region": UPBIT_REGION,
         "upbit_quote": UPBIT_QUOTE,
         "now": utc_now_iso(),
@@ -702,16 +816,29 @@ async def get_watchlist() -> Dict[str, Any]:
 
 @app.get("/history/status")
 async def history_status() -> Dict[str, Any]:
-    if not DATABASE_URL or not db.pool:
-        return {"history_enabled": False}
+    if not db.pool:
+        return {
+            "history_enabled": False,
+            "database_configured": bool(DATABASE_URL),
+            "database_error": db.last_error,
+        }
+
     async with db.pool.acquire() as conn:
         count = await conn.fetchval("SELECT COUNT(*) FROM snapshots")
         latest = await conn.fetchval("SELECT MAX(snapshot_at) FROM snapshots")
-    return {"history_enabled": True, "snapshot_count": count, "latest_snapshot_at": latest.isoformat() if latest else None}
+
+    return {
+        "history_enabled": True,
+        "snapshot_count": count,
+        "latest_snapshot_at": latest.isoformat() if latest else None,
+    }
 
 
 @app.get("/scan")
-async def scan(symbol: Optional[str] = Query(default=None), store: bool = Query(default=True)) -> JSONResponse:
+async def scan(
+    symbol: Optional[str] = Query(default=None),
+    store: bool = Query(default=True),
+) -> JSONResponse:
     payload = await scan_once(save=store)
 
     if symbol:
@@ -721,15 +848,25 @@ async def scan(symbol: Optional[str] = Query(default=None), store: bool = Query(
             for row in rows:
                 if row["symbol"] == symbol:
                     exact.append({"exchange": ex, **row})
+
         if not exact:
-            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found on configured watchlist or exchanges.")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Symbol {symbol} not found on configured watchlist or exchanges.",
+            )
+
         exact.sort(key=lambda x: x["signal_score"], reverse=True)
         return JSONResponse({
             "symbol": symbol,
             "matches": exact,
-            "cross_exchange_summary": next((x for x in payload["leaders_cross_exchange"] if x["symbol"] == symbol), None),
+            "cross_exchange_summary": next(
+                (x for x in payload["leaders_cross_exchange"] if x["symbol"] == symbol),
+                None,
+            ),
             "generated_at": payload["generated_at"],
             "history_enabled": payload["history_enabled"],
+            "database_configured": payload["database_configured"],
+            "database_error": payload["database_error"],
         })
 
     return JSONResponse(payload)
@@ -744,6 +881,8 @@ async def alerts_preview() -> JSONResponse:
         "preview": text,
         "candidates": payload["alert_candidates"],
         "generated_at": payload["generated_at"],
+        "database_configured": payload["database_configured"],
+        "database_error": payload["database_error"],
     })
 
 
@@ -756,9 +895,15 @@ async def alerts_send() -> JSONResponse:
 
     for row in payload["alert_candidates"]:
         fingerprint = leader_fingerprint(row)
-        if await db.recently_alerted(fingerprint, ALERT_COOLDOWN_MINUTES) if DATABASE_URL else False:
-            skipped.append({"symbol": row["symbol"], "reason": "cooldown"})
-            continue
+        if db.pool:
+            try:
+                if await db.recently_alerted(fingerprint, ALERT_COOLDOWN_MINUTES):
+                    skipped.append({"symbol": row["symbol"], "reason": "cooldown"})
+                    continue
+            except Exception as e:
+                db.last_error = f"{type(e).__name__}: {e}"
+                logger.exception("recently_alerted failed")
+
         candidates.append(row)
 
     text = build_alert_text(candidates)
@@ -768,14 +913,20 @@ async def alerts_send() -> JSONResponse:
             "reason": "No fresh candidates met thresholds.",
             "skipped": skipped,
             "generated_at": payload["generated_at"],
+            "database_configured": payload["database_configured"],
+            "database_error": payload["database_error"],
         })
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
         ok, telegram_payload = await send_telegram_message(client, text)
 
-    if ok and DATABASE_URL:
+    if ok and db.pool:
         for row in candidates:
-            await db.mark_alert_sent(row["symbol"], leader_fingerprint(row))
+            try:
+                await db.mark_alert_sent(row["symbol"], leader_fingerprint(row))
+            except Exception as e:
+                db.last_error = f"{type(e).__name__}: {e}"
+                logger.exception("mark_alert_sent failed")
 
     return JSONResponse({
         "sent": ok,
@@ -784,4 +935,6 @@ async def alerts_send() -> JSONResponse:
         "skipped": skipped,
         "telegram_response": telegram_payload,
         "generated_at": payload["generated_at"],
+        "database_configured": payload["database_configured"],
+        "database_error": payload["database_error"],
     })
