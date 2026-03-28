@@ -5,7 +5,7 @@ import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 import websockets
@@ -55,14 +55,22 @@ RAW_SYMBOLS = [
 # 单笔大额成交阈值
 SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "100000"))
 
-# 同方向同金额告警冷却，避免重复推送
+# 同交易所+同合约+同方向 的提醒冷却
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "15"))
 
-# 机器人刷单过滤参数
+# 机器人刷单过滤
 BOT_WINDOW_SEC = float(os.getenv("BOT_WINDOW_SEC", "3"))
 BOT_MIN_COUNT = int(os.getenv("BOT_MIN_COUNT", "4"))
 BOT_NOTIONAL_DIFF_RATIO = float(os.getenv("BOT_NOTIONAL_DIFF_RATIO", "0.005"))  # 0.5%
 BOT_PRICE_DIFF_RATIO = float(os.getenv("BOT_PRICE_DIFF_RATIO", "0.0005"))      # 0.05%
+
+# 双向流过滤：1分钟内买卖都很活跃时，不推送，避免做市/对冲噪音
+DUAL_FLOW_WINDOW_SEC = int(os.getenv("DUAL_FLOW_WINDOW_SEC", "60"))
+DUAL_FLOW_MIN_TOTAL = float(os.getenv("DUAL_FLOW_MIN_TOTAL", "500000"))
+DUAL_FLOW_RATIO_MIN = float(os.getenv("DUAL_FLOW_RATIO_MIN", "0.7"))
+
+# OKX instruments 定时刷新
+OKX_CTVAL_REFRESH_SEC = int(os.getenv("OKX_CTVAL_REFRESH_SEC", "3600"))
 
 # =========================
 # LOGGING
@@ -102,6 +110,12 @@ def to_okx_inst_id(sym: str) -> str:
     base = sym[:-4]
     return f"{base}-USDT-SWAP"
 
+def okx_inst_id_to_unified(inst_id: str) -> str:
+    if inst_id.endswith("-USDT-SWAP"):
+        base = inst_id.replace("-USDT-SWAP", "")
+        return f"{base}USDT"
+    return inst_id.replace("-", "")
+
 def side_to_cn(side: str) -> str:
     return "买入" if side.upper() == "BUY" else "卖出"
 
@@ -113,7 +127,7 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = chat_id
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
-        self.session: aiohttp.ClientSession | None = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
         if self.session is None:
@@ -153,19 +167,98 @@ class TradeEvent:
     qty: float
     notional_usdt: float
     ts_ms: int
+    raw_qty: Optional[float] = None
+    contract_multiplier: Optional[float] = None
 
 # =========================
-# BOT FILTER + LARGE TRADE DETECTOR
+# OKX CONTRACT VALUE CACHE
+# =========================
+class OkxContractSpecCache:
+    """
+    拉取 OKX SWAP instruments，缓存 instId -> ctVal
+    notional = px * sz * ctVal
+    """
+    def __init__(self):
+        self.ctval_map: Dict[str, float] = {}
+        self.last_refresh_ts: float = 0.0
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def start(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        await self.refresh()
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def refresh(self):
+        if self.session is None:
+            await self.start()
+
+        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error("拉取 OKX instruments 失败: %s %s", resp.status, body)
+                    return
+
+                data = await resp.json()
+                items = data.get("data", [])
+                ctval_map: Dict[str, float] = {}
+
+                for item in items:
+                    inst_id = item.get("instId")
+                    ct_val = item.get("ctVal")
+                    if not inst_id or ct_val in (None, ""):
+                        continue
+                    try:
+                        ctval_map[inst_id] = float(ct_val)
+                    except Exception:
+                        continue
+
+                if ctval_map:
+                    self.ctval_map = ctval_map
+                    self.last_refresh_ts = asyncio.get_running_loop().time()
+                    logger.info("OKX ctVal 已刷新，数量: %d", len(ctval_map))
+                else:
+                    logger.warning("OKX ctVal 刷新为空，保留旧缓存")
+        except Exception as e:
+            logger.exception("刷新 OKX ctVal 异常: %s", e)
+
+    async def auto_refresh_loop(self):
+        while True:
+            try:
+                await self.refresh()
+            except Exception as e:
+                logger.exception("OKX ctVal 定时刷新异常: %s", e)
+            await asyncio.sleep(OKX_CTVAL_REFRESH_SEC)
+
+    def get_ctval(self, inst_id: str) -> float:
+        return self.ctval_map.get(inst_id, 1.0)
+
+# =========================
+# LARGE TRADE DETECTOR
 # =========================
 class LargeTradeDetector:
     def __init__(self, notifier: TelegramNotifier):
         self.notifier = notifier
+
+        # 同方向冷却
         self.last_alert_at: Dict[Tuple[str, str, str], float] = {}
-        self.recent_trades: Dict[Tuple[str, str, str], Deque[TradeEvent]] = defaultdict(deque)
+
+        # 机器人刷单缓冲
+        self.recent_same_side_trades: Dict[Tuple[str, str, str], Deque[TradeEvent]] = defaultdict(deque)
+
+        # 双向流检测缓冲
+        self.recent_symbol_trades: Dict[Tuple[str, str], Deque[TradeEvent]] = defaultdict(deque)
 
     async def on_trade(self, ev: TradeEvent):
         if ev.notional_usdt < SINGLE_TRADE_USDT:
             return
+
+        self._push_dual_flow_buffer(ev)
 
         if self._is_bot_like(ev):
             logger.info(
@@ -174,16 +267,27 @@ class LargeTradeDetector:
             )
             return
 
+        if self._is_dual_flow_noise(ev):
+            logger.info(
+                "过滤双向流噪音 | %s | %s | %s | %.0f",
+                ev.exchange, ev.symbol, ev.side, ev.notional_usdt
+            )
+            return
+
         await self._alert_large_trade(ev)
 
+    def _push_dual_flow_buffer(self, ev: TradeEvent):
+        key = (ev.exchange, ev.symbol)
+        dq = self.recent_symbol_trades[key]
+        dq.append(ev)
+
+        cutoff = ev.ts_ms - DUAL_FLOW_WINDOW_SEC * 1000
+        while dq and dq[0].ts_ms < cutoff:
+            dq.popleft()
+
     def _is_bot_like(self, ev: TradeEvent) -> bool:
-        """
-        过滤逻辑：
-        在短时间内，如果同交易所、同合约、同方向，
-        出现多笔金额极接近、价格极接近的大单，判定为疑似机器人刷单，不推送。
-        """
         key = (ev.exchange, ev.symbol, ev.side)
-        dq = self.recent_trades[key]
+        dq = self.recent_same_side_trades[key]
         dq.append(ev)
 
         cutoff = ev.ts_ms - int(BOT_WINDOW_SEC * 1000)
@@ -204,11 +308,31 @@ class LargeTradeDetector:
         notional_ratio = (max_notional - min_notional) / max(min_notional, 1)
         price_ratio = (max_price - min_price) / max(min_price, 1)
 
-        # 短时间内多笔高度相似成交，疑似程序刷量或拆单刷屏
         if notional_ratio <= BOT_NOTIONAL_DIFF_RATIO and price_ratio <= BOT_PRICE_DIFF_RATIO:
             return True
 
         return False
+
+    def _is_dual_flow_noise(self, ev: TradeEvent) -> bool:
+        """
+        1分钟内买卖两边都很活跃，且金额接近，则视为双向流噪音
+        """
+        key = (ev.exchange, ev.symbol)
+        dq = self.recent_symbol_trades[key]
+        if not dq:
+            return False
+
+        buy_total = sum(x.notional_usdt for x in dq if x.side == "BUY")
+        sell_total = sum(x.notional_usdt for x in dq if x.side == "SELL")
+
+        if buy_total < DUAL_FLOW_MIN_TOTAL or sell_total < DUAL_FLOW_MIN_TOTAL:
+            return False
+
+        smaller = min(buy_total, sell_total)
+        bigger = max(buy_total, sell_total)
+        ratio = smaller / max(bigger, 1)
+
+        return ratio >= DUAL_FLOW_RATIO_MIN
 
     async def _alert_large_trade(self, ev: TradeEvent):
         key = (ev.exchange, ev.symbol, ev.side)
@@ -223,6 +347,10 @@ class LargeTradeDetector:
         side_cn = side_to_cn(ev.side)
         emoji = "🟢" if ev.side == "BUY" else "🔴"
 
+        extra = ""
+        if ev.exchange == "OKX" and ev.contract_multiplier is not None:
+            extra = f"\nOKX面值：{ev.contract_multiplier:g}"
+
         msg = (
             f"{emoji} 大额成交单\n"
             f"交易所：{ev.exchange}\n"
@@ -232,6 +360,7 @@ class LargeTradeDetector:
             f"价格：{ev.price}\n"
             f"数量：{ev.qty}\n"
             f"时间：{format_beijing_time(ev.ts_ms)}（北京时间）"
+            f"{extra}"
         )
 
         await self.notifier.send(msg)
@@ -275,6 +404,7 @@ class BinanceMonitor:
                             side=side,
                             price=price,
                             qty=qty,
+                            raw_qty=qty,
                             notional_usdt=notional,
                             ts_ms=ts_ms,
                         )
@@ -326,6 +456,7 @@ class BybitMonitor:
                                 side=side,
                                 price=price,
                                 qty=qty,
+                                raw_qty=qty,
                                 notional_usdt=notional,
                                 ts_ms=ts_ms,
                             )
@@ -338,16 +469,10 @@ class BybitMonitor:
 # OKX
 # =========================
 class OkxMonitor:
-    def __init__(self, detector: LargeTradeDetector, symbols: List[str]):
+    def __init__(self, detector: LargeTradeDetector, symbols: List[str], spec_cache: OkxContractSpecCache):
         self.detector = detector
         self.symbols = symbols
-
-    @staticmethod
-    def inst_id_to_unified(inst_id: str) -> str:
-        if inst_id.endswith("-USDT-SWAP"):
-            base = inst_id.replace("-USDT-SWAP", "")
-            return f"{base}USDT"
-        return inst_id.replace("-", "")
+        self.spec_cache = spec_cache
 
     async def run(self):
         url = "wss://ws.okx.com:8443/ws/v5/public"
@@ -362,8 +487,11 @@ class OkxMonitor:
                     async for raw in ws:
                         msg = json.loads(raw)
 
-                        if msg.get("event") in {"subscribe", "unsubscribe"}:
+                        if msg.get("event") in {"subscribe", "unsubscribe", "error"}:
+                            if msg.get("event") == "error":
+                                logger.warning("OKX 订阅错误: %s", msg)
                             continue
+
                         if "arg" not in msg or "data" not in msg:
                             continue
                         if msg["arg"].get("channel") != "trades":
@@ -371,10 +499,16 @@ class OkxMonitor:
 
                         for item in msg["data"]:
                             inst_id = item["instId"]
-                            symbol = self.inst_id_to_unified(inst_id)
+                            symbol = okx_inst_id_to_unified(inst_id)
+
                             price = float(item["px"])
-                            qty = float(item["sz"])
-                            notional = price * qty  # 近似值
+                            contracts = float(item["sz"])
+                            ct_val = self.spec_cache.get_ctval(inst_id)
+
+                            # 修正后的名义金额
+                            qty_coin = contracts * ct_val
+                            notional = price * qty_coin
+
                             side = item["side"].upper()
                             ts_ms = int(item["ts"])
 
@@ -383,7 +517,9 @@ class OkxMonitor:
                                 symbol=symbol,
                                 side=side,
                                 price=price,
-                                qty=qty,
+                                qty=qty_coin,
+                                raw_qty=contracts,
+                                contract_multiplier=ct_val,
                                 notional_usdt=notional,
                                 ts_ms=ts_ms,
                             )
@@ -399,19 +535,27 @@ async def main():
     notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
     await notifier.start()
 
+    okx_spec_cache = OkxContractSpecCache()
+    await okx_spec_cache.start()
+
     detector = LargeTradeDetector(notifier)
 
     monitors = [
         BinanceMonitor(detector, USER_SYMBOLS),
         BybitMonitor(detector, USER_SYMBOLS),
-        OkxMonitor(detector, USER_SYMBOLS),
+        OkxMonitor(detector, USER_SYMBOLS, okx_spec_cache),
     ]
 
     logger.info("启动监控币种: %s", ", ".join(USER_SYMBOLS))
+
     try:
-        await asyncio.gather(*(m.run() for m in monitors))
+        await asyncio.gather(
+            okx_spec_cache.auto_refresh_loop(),
+            *(m.run() for m in monitors),
+        )
     finally:
         await notifier.close()
+        await okx_spec_cache.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
