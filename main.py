@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Watchlist Rotation Scanner", version="0.3.1")
+app = FastAPI(title="资金轮动监控器", version="0.5.0")
 
 BINANCE_FAPI = "https://fapi.binance.com"
 BYBIT_API = "https://api.bybit.com"
@@ -157,11 +157,11 @@ def compute_signal(row: Dict[str, Any], peer_rows: List[Dict[str, Any]]) -> Dict
     if momo_score >= 8:
         tags.append("波动增强")
     if breakout_score >= 7:
-        tags.append("接近突破")
+        tags.append("接近区间上沿")
     if price_move >= 8:
-        tags.append("情绪升温")
+        tags.append("多头情绪升温")
     if price_move <= -8:
-        tags.append("负向异动")
+        tags.append("空头情绪升温")
 
     return {
         **row,
@@ -203,7 +203,7 @@ async def get_binance(client: httpx.AsyncClient, watchlist: List[str]) -> List[D
             rows[symbol]["open_interest"] = contracts
             rows[symbol]["open_interest_value_usd"] = contracts * rows[symbol]["last_price"]
         except Exception:
-            logger.exception("Binance OI fetch failed for %s", symbol)
+            logger.exception("Binance OI 获取失败: %s", symbol)
 
     await asyncio.gather(*(enrich(symbol) for symbol in rows.keys()))
     return list(rows.values())
@@ -272,7 +272,7 @@ async def get_okx(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dict[
                 rows[symbol]["open_interest"] = safe_float(oi_row.get("oi"))
                 rows[symbol]["open_interest_value_usd"] = safe_float(oi_row.get("oiCcy"))
         except Exception:
-            logger.exception("OKX OI fetch failed for %s", symbol)
+            logger.exception("OKX OI 获取失败: %s", symbol)
 
     await asyncio.gather(*(enrich(symbol) for symbol in rows.keys()))
     return list(rows.values())
@@ -337,7 +337,7 @@ async def get_upbit(client: httpx.AsyncClient, watchlist: List[str]) -> List[Dic
     try:
         data = await fetch_json(client, f"{UPBIT_API}/v1/ticker", params={"markets": ",".join(markets)})
     except Exception:
-        logger.exception("Upbit fetch failed")
+        logger.exception("Upbit 数据获取失败")
         return []
 
     reverse = {upbit_market(s): s for s in watchlist}
@@ -376,7 +376,7 @@ def score_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
-    headers = {"User-Agent": "watchlist-rotation-scanner/0.3.1"}
+    headers = {"User-Agent": "rotation-scanner-cn/0.5.0"}
 
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         tasks = {
@@ -392,12 +392,83 @@ async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, 
     markets: Dict[str, List[Dict[str, Any]]] = {}
     for name, payload in zip(tasks.keys(), raw_results):
         if isinstance(payload, Exception):
-            logger.exception("Exchange fetch failed for %s: %s", name, payload)
+            logger.exception("交易所数据获取失败 %s: %s", name, payload)
             markets[name] = []
         else:
             markets[name] = score_rows(payload)
 
     return markets
+
+
+def generate_trade_signal(row: Dict[str, Any]) -> str:
+    score = safe_float(row.get("avg_signal_score"))
+    vol = safe_float(row.get("volume_growth_pct_vs_baseline"))
+    oi = safe_float(row.get("oi_growth_pct_vs_baseline"))
+    price = safe_float(row.get("price_change_pct_24h_avg"))
+    ex_count = len(row.get("exchanges", []))
+    signal_growth = safe_float(row.get("signal_growth_vs_baseline"))
+
+    # 做多买入：多交易所共振 + 放量 + OI上升 + 涨幅还不算太大
+    if (
+        score >= 60
+        and vol >= 20
+        and oi >= 10
+        and 0 <= price < 25
+        and ex_count >= 2
+    ):
+        return "做多买入"
+
+    # 做多观察：有升温迹象，但还没达到强确认
+    if (
+        score >= 55
+        and vol >= 10
+        and 0 <= price < 35
+        and ex_count >= 2
+    ):
+        return "做多观察"
+
+    # 做空买入：空头方向明显增强，且不是单纯已经跌完
+    if (
+        score >= 60
+        and vol >= 20
+        and oi >= 10
+        and -25 < price <= 0
+        and ex_count >= 2
+    ):
+        return "做空买入"
+
+    # 做空观察：开始转弱，但还没到强确认
+    if (
+        score >= 55
+        and vol >= 10
+        and -35 < price <= 0
+        and ex_count >= 2
+    ):
+        return "做空观察"
+
+    # 多单止盈：已经大涨，或者上涨后动能开始掉
+    if (
+        price > 60
+        or (price > 35 and (signal_growth < 0 or oi < 0))
+    ):
+        return "多单止盈"
+
+    # 空单止盈：已经大跌，或者下跌后动能开始掉
+    if (
+        price < -60
+        or (price < -35 and (signal_growth > 0 or oi > 0))
+    ):
+        return "空单止盈"
+
+    # 止损：信号整体失效
+    if (
+        score < 40
+        or signal_growth <= -8
+        or (vol < -15 and oi < -10)
+    ):
+        return "止损"
+
+    return "观望"
 
 
 def build_cross_exchange_summary(markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -457,8 +528,8 @@ class Database:
     async def connect(self) -> bool:
         if not self.dsn:
             self.enabled = False
-            self.last_error = "DATABASE_URL is empty"
-            logger.warning("Database disabled: DATABASE_URL is empty.")
+            self.last_error = "DATABASE_URL 为空"
+            logger.warning("数据库未启用：DATABASE_URL 为空。")
             return False
 
         if self.pool is not None:
@@ -474,19 +545,14 @@ class Database:
             await self.init_schema()
             self.enabled = True
             self.last_error = None
-            logger.info("Database connected successfully.")
+            logger.info("数据库连接成功。")
             return True
         except Exception as e:
             self.pool = None
             self.enabled = False
             self.last_error = f"{type(e).__name__}: {e}"
-            logger.exception("Database connection failed.")
+            logger.exception("主数据库连接失败。")
             return False
-
-    async def reconnect(self) -> bool:
-        await self.close()
-        await asyncio.sleep(1)
-        return await self.connect()
 
     async def close(self) -> None:
         if self.pool:
@@ -621,7 +687,7 @@ db = Database(DATABASE_URL)
 async def on_startup() -> None:
     ok = await db.connect()
     if not ok:
-        logger.warning("Database unavailable. App continues without Postgres. error=%s", db.last_error)
+        logger.warning("主程序：数据库不可用。应用将继续运行，但不会使用 Postgres。错误=%s", db.last_error)
 
 
 @app.on_event("shutdown")
@@ -675,8 +741,11 @@ def enrich_with_history(
             flags.append("OI扩张")
         if leader.get("signal_growth_vs_baseline") is not None and leader["signal_growth_vs_baseline"] >= 6:
             flags.append("评分加速")
+        if leader.get("signal_growth_vs_baseline") is not None and leader["signal_growth_vs_baseline"] <= -6:
+            flags.append("评分走弱")
 
         leader["historical_flags"] = flags
+        leader["交易信号"] = generate_trade_signal(leader)
 
     return leaders
 
@@ -684,23 +753,39 @@ def enrich_with_history(
 def build_alert_candidates(leaders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for row in leaders:
-        strong = row["avg_signal_score"] >= MIN_SIGNAL_TO_ALERT
-        multi_ex = len(row["exchanges"]) >= MIN_EXCHANGES_TO_ALERT
-        improving = (
-            (row.get("signal_growth_vs_baseline") is not None and row["signal_growth_vs_baseline"] >= 4)
-            or (row.get("volume_growth_pct_vs_baseline") is not None and row["volume_growth_pct_vs_baseline"] >= 15)
-            or (row.get("oi_growth_pct_vs_baseline") is not None and row["oi_growth_pct_vs_baseline"] >= 8)
-        )
-        if strong and multi_ex and improving:
+        signal = row.get("交易信号", "观望")
+        if signal == "观望":
+            continue
+
+        strong_enough = row["avg_signal_score"] >= MIN_SIGNAL_TO_ALERT or signal in {"多单止盈", "空单止盈", "止损"}
+        multi_ex = len(row["exchanges"]) >= MIN_EXCHANGES_TO_ALERT or signal in {"多单止盈", "空单止盈", "止损"}
+
+        if strong_enough and multi_ex:
             out.append(row)
 
-    out.sort(key=lambda x: (x["avg_signal_score"], len(x["exchanges"])), reverse=True)
+    priority = {
+        "做多买入": 1,
+        "做空买入": 2,
+        "做多观察": 3,
+        "做空观察": 4,
+        "多单止盈": 5,
+        "空单止盈": 6,
+        "止损": 7,
+        "观望": 99,
+    }
+
+    out.sort(
+        key=lambda x: (
+            priority.get(x.get("交易信号", "观望"), 99),
+            -x["avg_signal_score"],
+        )
+    )
     return out[:8]
 
 
 async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[bool, Any]:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, {"error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing"}
+        return False, {"error": "TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未配置"}
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -715,23 +800,39 @@ async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[b
 
 def leader_fingerprint(row: Dict[str, Any]) -> str:
     exchanges = ",".join(sorted(row["exchanges"]))
-    score_bucket = int(row["avg_signal_score"] // 5)
-    return f"{row['symbol']}|{exchanges}|{score_bucket}"
+    signal = row.get("交易信号", "观望")
+    score_bucket = int(safe_float(row["avg_signal_score"]) // 5)
+    return f"{row['symbol']}|{signal}|{exchanges}|{score_bucket}"
 
 
 def build_alert_text(candidates: List[Dict[str, Any]]) -> str:
     if not candidates:
         return ""
 
-    lines = [f"🚨 Rotation Scanner Alert {utc_now_iso()}"]
+    emoji_map = {
+        "做多买入": "🟢",
+        "做多观察": "🟡",
+        "做空买入": "🟣",
+        "做空观察": "🟠",
+        "多单止盈": "🔴",
+        "空单止盈": "🔵",
+        "止损": "⚫",
+        "观望": "⚪",
+    }
+
+    lines = [f"🚨 中文交易信号 {utc_now_iso()}"]
     for row in candidates:
-        flags = ",".join(row.get("historical_flags") or [])
+        signal = row.get("交易信号", "观望")
+        emoji = emoji_map.get(signal, "⚪")
         lines.append(
-            f"- {row['symbol']} | score={row['avg_signal_score']} | ex={','.join(row['exchanges'])} | "
-            f"chg24h={row['price_change_pct_24h_avg']}% | vol24h=${row['quote_volume_24h_sum']:,.0f} | "
-            f"volΔ={row.get('volume_growth_pct_vs_baseline')}% | oiΔ={row.get('oi_growth_pct_vs_baseline')}% | "
-            f"flags={flags}"
+            f"{emoji} {signal} {row['symbol']}\n"
+            f"评分={row['avg_signal_score']} | 交易所={','.join(row['exchanges'])}\n"
+            f"24h涨跌={row['price_change_pct_24h_avg']}% | "
+            f"量能变化={row.get('volume_growth_pct_vs_baseline')}% | "
+            f"OI变化={row.get('oi_growth_pct_vs_baseline')}% | "
+            f"评分变化={row.get('signal_growth_vs_baseline')}\n"
         )
+
     return "\n".join(lines)
 
 
@@ -743,7 +844,7 @@ async def scan_once(save: bool = True) -> Dict[str, Any]:
             await db.insert_snapshots(markets)
         except Exception as e:
             db.last_error = f"{type(e).__name__}: {e}"
-            logger.exception("Insert snapshots failed")
+            logger.exception("快照写入失败")
 
     leaders = build_cross_exchange_summary(markets)
 
@@ -753,7 +854,7 @@ async def scan_once(save: bool = True) -> Dict[str, Any]:
             baseline = await db.get_baseline(SNAPSHOT_LOOKBACK_MINUTES)
         except Exception as e:
             db.last_error = f"{type(e).__name__}: {e}"
-            logger.exception("Get baseline failed")
+            logger.exception("基线读取失败")
 
     leaders = enrich_with_history(leaders, baseline, markets)
     candidates = build_alert_candidates(leaders)
@@ -852,7 +953,7 @@ async def scan(
         if not exact:
             raise HTTPException(
                 status_code=404,
-                detail=f"Symbol {symbol} not found on configured watchlist or exchanges.",
+                detail=f"未在监控列表或当前交易所结果中找到 {symbol}",
             )
 
         exact.sort(key=lambda x: x["signal_score"], reverse=True)
@@ -898,11 +999,11 @@ async def alerts_send() -> JSONResponse:
         if db.pool:
             try:
                 if await db.recently_alerted(fingerprint, ALERT_COOLDOWN_MINUTES):
-                    skipped.append({"symbol": row["symbol"], "reason": "cooldown"})
+                    skipped.append({"symbol": row["symbol"], "reason": "冷却中"})
                     continue
             except Exception as e:
                 db.last_error = f"{type(e).__name__}: {e}"
-                logger.exception("recently_alerted failed")
+                logger.exception("冷却检测失败")
 
         candidates.append(row)
 
@@ -910,7 +1011,7 @@ async def alerts_send() -> JSONResponse:
     if not text:
         return JSONResponse({
             "sent": False,
-            "reason": "No fresh candidates met thresholds.",
+            "reason": "当前没有新的中文交易信号。",
             "skipped": skipped,
             "generated_at": payload["generated_at"],
             "database_configured": payload["database_configured"],
@@ -926,7 +1027,7 @@ async def alerts_send() -> JSONResponse:
                 await db.mark_alert_sent(row["symbol"], leader_fingerprint(row))
             except Exception as e:
                 db.last_error = f"{type(e).__name__}: {e}"
-                logger.exception("mark_alert_sent failed")
+                logger.exception("告警记录写入失败")
 
     return JSONResponse({
         "sent": ok,
