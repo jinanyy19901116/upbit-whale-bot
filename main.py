@@ -1,448 +1,407 @@
+# main.py
 import asyncio
 import json
+import logging
+import os
 import time
-from collections import deque, defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List
+from typing import Deque, Dict, List, Tuple
 
 import aiohttp
 import websockets
 
+# =========================
+# ENV
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-CONFIG = {
-    # 30 个“SIGN 类型”观察池（身份 / 凭证 / AI / 数据 / Agent / 相关叙事）
-    # 不保证每个交易所都全有；没有数据的不会影响程序继续运行
-    "symbols": [
-        "signusdt",
-        "kiteusdt",
-        "hypeusdt",
-        "sirenusdt",
-        "phausdt",
-        "powerusdt",
-        "skyaiusdt",
-        "bardusdt",
-        "qusdt",
-        "uaiusdt",
-        "husdt",
-        "icxusdt",
-        "robousdt",
-        "ognusdt",
-        "xaiusdt",
-        "ipusdt",
-        "xagusdt",
-        "gusdt",
-        "ankrusdt",
-        "animeusdt",
-        "banusdt",
-        "gunusdt",
-        "zrousdt",
-        "cusdt",
-        "lightusdt",
-        "cvcusdt",
-        "avausdt",
-    ],
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in environment variables")
 
-    # Binance 市场数据 WS：优先用你已经验证可用的 vision
-    "binance_ws_urls": [
-        "wss://data-stream.binance.vision",
-        "wss://stream.binance.com:443",
-        "wss://stream.binance.com:9443",
-    ],
+# =========================
+# USER CONFIG
+# =========================
+RAW_SYMBOLS = [
+    "signusdt",
+    "kiteusdt",
+    "hypeusdt",
+    "sirenusdt",
+    "phausdt",
+    "powerusdt",
+    "skyaiusdt",
+    "bardusdt",
+    "qusdt",
+    "uaiusdt",
+    "husdt",
+    "icxusdt",
+    "robousdt",
+    "ognusdt",
+    "xaiusdt",
+    "ipusdt",
+    "xagusdt",
+    "gusdt",
+    "ankrusdt",
+    "animeusdt",
+    "banusdt",
+    "gunusdt",
+    "zrousdt",
+    "cusdt",
+    "lightusdt",
+    "cvcusdt",
+    "avausdt",
+]
 
-    # Gate
-    "gate_ws_url": "wss://api.gateio.ws/ws/v4/",
-    "gate_rest_url": "https://api.gateio.ws/api/v4",
+# 阈值可在 Railway 环境变量里覆盖
+SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "100000"))
+SWEEP_WINDOW_SEC = float(os.getenv("SWEEP_WINDOW_SEC", "5"))
+SWEEP_TOTAL_USDT = float(os.getenv("SWEEP_TOTAL_USDT", "300000"))
+SWEEP_MIN_TRADES = int(os.getenv("SWEEP_MIN_TRADES", "3"))
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "20"))
 
-    # 你提供的 Telegram
-    "telegram_bot_token": "8783197055:AAG7vbzYzTsTU0Zwyb8uQiXub_MffUb7GDI",
-    "telegram_chat_id": "5671949305",
-    "telegram_test_on_start": True,
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("whale-monitor")
 
-    # 扫单参数
-    "sweep_window_sec": 1.2,
-    "sweep_min_notional_usdt": 50000.0,
-    "cooldown_sec": 15,
+# =========================
+# NORMALIZATION HELPERS
+# =========================
+def normalize_user_symbols(raw: List[str]) -> List[str]:
+    out = []
+    for s in raw:
+        s = s.strip().upper()
+        if not s.endswith("USDT"):
+            continue
+        out.append(s)
+    return out
 
-    # 稳定性参数
-    "heartbeat_sec": 30,
-    "recv_timeout_sec": 60,
-    "reconnect_delay_sec": 5,
-    "ws_open_timeout_sec": 20,
-    "ws_ping_interval_sec": 20,
-    "ws_ping_timeout_sec": 20,
-    "ws_force_reconnect_after_sec": 23 * 60 * 60,
+USER_SYMBOLS = normalize_user_symbols(RAW_SYMBOLS)
 
-    "verbose": True,
-}
+def to_binance_symbol(sym: str) -> str:
+    return sym.lower()
 
+def to_bybit_symbol(sym: str) -> str:
+    return sym.upper()
 
-def now_ts() -> float:
-    return time.time()
+def to_okx_inst_id(sym: str) -> str:
+    base = sym[:-4]
+    return f"{base}-USDT-SWAP"
 
-
-def fmt_usdt(v: float) -> str:
-    if v >= 1_000_000_000:
-        return f"{v / 1_000_000_000:.2f}B"
-    if v >= 1_000_000:
-        return f"{v / 1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"{v / 1_000:.2f}K"
-    return f"{v:.2f}"
-
-
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-
-class TelegramPusher:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.enabled = bool(bot_token and chat_id)
+# =========================
+# TELEGRAM
+# =========================
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
         self.chat_id = chat_id
-        self.url = f"https://api.telegram.org/bot{bot_token}/sendMessage" if self.enabled else ""
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.session: aiohttp.ClientSession | None = None
 
-    async def send(self, session: aiohttp.ClientSession, text: str) -> bool:
-        if not self.enabled:
-            log("[TG] skipped: token/chat_id 未配置")
-            return False
+    async def start(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
 
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def send(self, text: str):
+        if self.session is None:
+            await self.start()
         try:
-            async with session.post(
+            async with self.session.post(
                 self.url,
-                data={"chat_id": self.chat_id, "text": text},
-                timeout=12,
+                data={
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "disable_web_page_preview": "true",
+                },
             ) as resp:
-                body = await resp.text()
                 if resp.status != 200:
-                    log(f"[TG ERROR] HTTP {resp.status}: {body}")
-                    return False
-                return True
+                    body = await resp.text()
+                    logger.error("Telegram send failed: %s %s", resp.status, body)
         except Exception as e:
-            log(f"[TG ERROR] {e}")
-            return False
+            logger.exception("Telegram error: %s", e)
 
-
+# =========================
+# EVENT MODEL
+# =========================
 @dataclass
 class TradeEvent:
-    ts: float
+    exchange: str
+    symbol: str            # unified, e.g. SIGNUSDT
+    side: str              # BUY / SELL
     price: float
-    size: float
-    side: str  # buy / sell
+    qty: float
+    notional_usdt: float
+    ts_ms: int
 
+# =========================
+# DETECTOR
+# =========================
+class SweepDetector:
+    def __init__(self, notifier: TelegramNotifier):
+        self.notifier = notifier
+        self.buffers: Dict[Tuple[str, str, str], Deque[TradeEvent]] = defaultdict(deque)
+        self.last_alert_at: Dict[Tuple[str, str, str, str], float] = {}
 
-class SymbolState:
-    def __init__(self, symbol: str):
-        self.symbol = symbol.lower()
-        self.symbol_display = self.symbol.upper()
-        self.trades: Deque[TradeEvent] = deque()
-        self.buy_notional = 0.0
-        self.sell_notional = 0.0
-        self.last_alert_at: Dict[str, float] = defaultdict(lambda: 0.0)
-        self.last_trade_ts = 0.0
-        self.last_trade_price = 0.0
-        self.binance_seen = False
-        self.gate_seen = False
+    async def on_trade(self, ev: TradeEvent):
+        await self._maybe_alert_single(ev)
+        await self._maybe_alert_sweep(ev)
 
-    def add_trade(self, price: float, size: float, side: str, source: str) -> None:
-        event = TradeEvent(
-            ts=now_ts(),
-            price=price,
-            size=size,
-            side=side,
+    async def _maybe_alert_single(self, ev: TradeEvent):
+        if ev.notional_usdt < SINGLE_TRADE_USDT:
+            return
+
+        key = (ev.exchange, ev.symbol, ev.side, "single")
+        now = time.time()
+        if now - self.last_alert_at.get(key, 0) < ALERT_COOLDOWN_SEC:
+            return
+        self.last_alert_at[key] = now
+
+        emoji = "🟢" if ev.side == "BUY" else "🔴"
+        msg = (
+            f"{emoji} 大额成交\n"
+            f"交易所: {ev.exchange}\n"
+            f"合约: {ev.symbol}\n"
+            f"方向: {ev.side}\n"
+            f"金额: {ev.notional_usdt:,.0f} USDT\n"
+            f"价格: {ev.price}\n"
+            f"数量: {ev.qty}\n"
+            f"时间: {ev.ts_ms}"
         )
-        self.trades.append(event)
-        notional = price * size
+        await self.notifier.send(msg)
+        logger.info("single alert | %s | %s | %s | %.0f", ev.exchange, ev.symbol, ev.side, ev.notional_usdt)
 
-        if side == "buy":
-            self.buy_notional += notional
-        else:
-            self.sell_notional += notional
+    async def _maybe_alert_sweep(self, ev: TradeEvent):
+        key = (ev.exchange, ev.symbol, ev.side)
+        dq = self.buffers[key]
+        dq.append(ev)
 
-        self.last_trade_ts = event.ts
-        self.last_trade_price = price
+        cutoff = ev.ts_ms - int(SWEEP_WINDOW_SEC * 1000)
+        while dq and dq[0].ts_ms < cutoff:
+            dq.popleft()
 
-        if source == "binance":
-            self.binance_seen = True
-        elif source == "gate":
-            self.gate_seen = True
+        total = sum(x.notional_usdt for x in dq)
+        count = len(dq)
 
-        self.cleanup()
+        if total < SWEEP_TOTAL_USDT or count < SWEEP_MIN_TRADES:
+            return
 
-    def cleanup(self) -> None:
-        cutoff = now_ts() - CONFIG["sweep_window_sec"]
-        while self.trades and self.trades[0].ts < cutoff:
-            old = self.trades.popleft()
-            notional = old.price * old.size
-            if old.side == "buy":
-                self.buy_notional -= notional
-            else:
-                self.sell_notional -= notional
+        alert_key = (ev.exchange, ev.symbol, ev.side, "sweep")
+        now = time.time()
+        if now - self.last_alert_at.get(alert_key, 0) < ALERT_COOLDOWN_SEC:
+            return
+        self.last_alert_at[alert_key] = now
 
-        if self.buy_notional < 0:
-            self.buy_notional = 0.0
-        if self.sell_notional < 0:
-            self.sell_notional = 0.0
+        first_ts = dq[0].ts_ms
+        last_ts = dq[-1].ts_ms
+        seconds = max((last_ts - first_ts) / 1000, 0.001)
 
-    def can_alert(self, key: str) -> bool:
-        return now_ts() - self.last_alert_at[key] >= CONFIG["cooldown_sec"]
+        emoji = "🚀" if ev.side == "BUY" else "💥"
+        msg = (
+            f"{emoji} 连续扫单\n"
+            f"交易所: {ev.exchange}\n"
+            f"合约: {ev.symbol}\n"
+            f"方向: {ev.side}\n"
+            f"窗口: {seconds:.2f}s\n"
+            f"笔数: {count}\n"
+            f"累计金额: {total:,.0f} USDT\n"
+            f"最新价格: {ev.price}\n"
+            f"单笔阈值: {SINGLE_TRADE_USDT:,.0f} / "
+            f"扫单阈值: {SWEEP_TOTAL_USDT:,.0f}"
+        )
+        await self.notifier.send(msg)
+        logger.info("sweep alert | %s | %s | %s | count=%d total=%.0f", ev.exchange, ev.symbol, ev.side, count, total)
 
-    def mark_alert(self, key: str) -> None:
-        self.last_alert_at[key] = now_ts()
+# =========================
+# BINANCE
+# docs: <symbol>@aggTrade, lowercase symbols; combined streams supported.
+# buyer maker(m=true) => taker SELL, else BUY
+# =========================
+class BinanceMonitor:
+    def __init__(self, detector: SweepDetector, symbols: List[str]):
+        self.detector = detector
+        self.symbols = symbols
 
-    def check_alerts(self) -> List[str]:
-        alerts: List[str] = []
+    async def run(self):
+        streams = "/".join(f"{to_binance_symbol(s)}@aggTrade" for s in self.symbols)
+        url = f"wss://fstream.binance.com/stream?streams={streams}"
 
-        if self.buy_notional >= CONFIG["sweep_min_notional_usdt"] and self.can_alert("buy"):
-            self.mark_alert("buy")
-            alerts.append(
-                f"🚀 扫单提醒\n\n"
-                f"交易对: {self.symbol_display}\n"
-                f"类型: 主动买入扫单\n"
-                f"窗口: {CONFIG['sweep_window_sec']:.1f} 秒\n"
-                f"累计成交额: {fmt_usdt(self.buy_notional)} USDT\n"
-                f"最近成交价: {self.last_trade_price:.8f}\n"
-                f"来源: 多交易所成交流\n"
-            )
-
-        if self.sell_notional >= CONFIG["sweep_min_notional_usdt"] and self.can_alert("sell"):
-            self.mark_alert("sell")
-            alerts.append(
-                f"🔻 扫单提醒\n\n"
-                f"交易对: {self.symbol_display}\n"
-                f"类型: 主动卖出扫单\n"
-                f"窗口: {CONFIG['sweep_window_sec']:.1f} 秒\n"
-                f"累计成交额: {fmt_usdt(self.sell_notional)} USDT\n"
-                f"最近成交价: {self.last_trade_price:.8f}\n"
-                f"来源: 多交易所成交流\n"
-            )
-
-        return alerts
-
-
-async def test_gate_rest(session: aiohttp.ClientSession) -> None:
-    try:
-        url = f"{CONFIG['gate_rest_url']}/spot/currencies"
-        async with session.get(url, timeout=12) as resp:
-            if resp.status == 200:
-                log("[GATE REST TEST] OK")
-            else:
-                log(f"[GATE REST TEST] HTTP {resp.status}")
-    except Exception as e:
-        log(f"[GATE REST TEST] FAILED: {e}")
-
-
-async def test_telegram(session: aiohttp.ClientSession, tg: TelegramPusher) -> None:
-    if not CONFIG["telegram_test_on_start"]:
-        log("[TG TEST] skipped")
-        return
-    ok = await tg.send(session, "✅ Telegram 测试成功，监控脚本准备启动")
-    log("[TG TEST] OK" if ok else "[TG TEST] FAILED")
-
-
-def build_binance_stream_path(symbols: List[str]) -> str:
-    streams = []
-    for s in symbols:
-        streams.append(f"{s}@aggTrade")
-    return "/stream?streams=" + "/".join(streams)
-
-
-async def run_binance(states: Dict[str, SymbolState]) -> None:
-    path = build_binance_stream_path(CONFIG["symbols"])
-
-    while True:
-        for base in CONFIG["binance_ws_urls"]:
-            ws = None
-            connected_at = now_ts()
-
+        while True:
             try:
-                url = base + path
-                log(f"[BINANCE] connecting {url}")
-                ws = await websockets.connect(
-                    url,
-                    open_timeout=CONFIG["ws_open_timeout_sec"],
-                    ping_interval=CONFIG["ws_ping_interval_sec"],
-                    ping_timeout=CONFIG["ws_ping_timeout_sec"],
-                    max_size=2**23,
-                )
-                log(f"[BINANCE] connected via {base}")
-                connected_at = now_ts()
+                logger.info("Binance connected")
+                async with websockets.connect(url, ping_interval=150, ping_timeout=30, max_size=2**23) as ws:
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        data = msg.get("data")
+                        if not data or data.get("e") != "aggTrade":
+                            continue
 
-                while True:
-                    if now_ts() - connected_at >= CONFIG["ws_force_reconnect_after_sec"]:
-                        raise RuntimeError("scheduled reconnect before 24h disconnect")
+                        symbol = data["s"].upper()
+                        price = float(data["p"])
+                        qty = float(data["q"])
+                        notional = price * qty
+                        side = "SELL" if data.get("m", False) else "BUY"
+                        ts_ms = int(data["T"])
 
-                    raw = await asyncio.wait_for(ws.recv(), timeout=CONFIG["recv_timeout_sec"])
-                    msg = json.loads(raw)
-
-                    data = msg.get("data", {})
-                    symbol = data.get("s", "").lower()
-                    if symbol not in states:
-                        continue
-
-                    price = float(data["p"])
-                    qty = float(data["q"])
-                    side = "sell" if data.get("m", False) else "buy"
-
-                    states[symbol].add_trade(price, qty, side, "binance")
-
+                        ev = TradeEvent(
+                            exchange="BINANCE",
+                            symbol=symbol,
+                            side=side,
+                            price=price,
+                            qty=qty,
+                            notional_usdt=notional,
+                            ts_ms=ts_ms,
+                        )
+                        await self.detector.on_trade(ev)
             except Exception as e:
-                log(f"[BINANCE ERROR] {e}")
+                logger.exception("Binance error: %s", e)
+                await asyncio.sleep(5)
 
-            finally:
-                if ws is not None:
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
+# =========================
+# BYBIT
+# docs: publicTrade.{symbol}; S is taker side Buy/Sell
+# =========================
+class BybitMonitor:
+    def __init__(self, detector: SweepDetector, symbols: List[str]):
+        self.detector = detector
+        self.symbols = symbols
 
-        log(f"[BINANCE] retry in {CONFIG['reconnect_delay_sec']}s")
-        await asyncio.sleep(CONFIG["reconnect_delay_sec"])
+    async def run(self):
+        url = "wss://stream.bybit.com/v5/public/linear"
+        topics = [f"publicTrade.{to_bybit_symbol(s)}" for s in self.symbols]
 
+        while True:
+            try:
+                logger.info("Bybit connected")
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**23) as ws:
+                    sub = {"op": "subscribe", "args": topics}
+                    await ws.send(json.dumps(sub))
 
-def gate_symbol(symbol: str) -> str:
-    base = symbol[:-4].upper()
-    quote = symbol[-4:].upper()
-    return f"{base}_{quote}"
+                    async for raw in ws:
+                        msg = json.loads(raw)
 
+                        # 订阅错误 / 非数据消息
+                        if msg.get("op") == "subscribe":
+                            continue
+                        topic = msg.get("topic", "")
+                        data = msg.get("data", [])
+                        if not topic.startswith("publicTrade.") or not data:
+                            continue
 
-async def run_gate(states: Dict[str, SymbolState]) -> None:
-    payload = [gate_symbol(s) for s in CONFIG["symbols"]]
+                        for item in data:
+                            symbol = item["s"].upper()
+                            price = float(item["p"])
+                            qty = float(item["v"])
+                            notional = price * qty
+                            side = item["S"].upper()
+                            ts_ms = int(item["T"])
 
-    while True:
-        ws = None
-        connected_at = now_ts()
+                            ev = TradeEvent(
+                                exchange="BYBIT",
+                                symbol=symbol,
+                                side=side,
+                                price=price,
+                                qty=qty,
+                                notional_usdt=notional,
+                                ts_ms=ts_ms,
+                            )
+                            await self.detector.on_trade(ev)
+            except Exception as e:
+                logger.exception("Bybit error: %s", e)
+                await asyncio.sleep(5)
 
-        try:
-            log(f"[GATE] connecting {CONFIG['gate_ws_url']}")
-            ws = await websockets.connect(
-                CONFIG["gate_ws_url"],
-                open_timeout=CONFIG["ws_open_timeout_sec"],
-                ping_interval=CONFIG["ws_ping_interval_sec"],
-                ping_timeout=CONFIG["ws_ping_timeout_sec"],
-                max_size=2**23,
-            )
-            log("[GATE] connected")
-            connected_at = now_ts()
+# =========================
+# OKX
+# docs: public WS channel "trades", instrument IDs like BTC-USDT-SWAP
+# side field is taker side buy/sell
+# 注意: sz 是合约张数，不同币种合约面值不同；这里用 px * sz 近似 USDT 名义金额
+# 若你后续要更精确，需要再接 instruments 接口换算 ctVal
+# =========================
+class OkxMonitor:
+    def __init__(self, detector: SweepDetector, symbols: List[str]):
+        self.detector = detector
+        self.symbols = symbols
 
-            subscribe_msg = {
-                "time": int(time.time()),
-                "channel": "spot.trades",
-                "event": "subscribe",
-                "payload": payload,
-            }
-            await ws.send(json.dumps(subscribe_msg))
-            log(f"[GATE] subscribed: {payload}")
+    @staticmethod
+    def inst_id_to_unified(inst_id: str) -> str:
+        # SIGN-USDT-SWAP -> SIGNUSDT
+        if inst_id.endswith("-USDT-SWAP"):
+            base = inst_id.replace("-USDT-SWAP", "")
+            return f"{base}USDT"
+        return inst_id.replace("-", "")
 
-            while True:
-                if now_ts() - connected_at >= CONFIG["ws_force_reconnect_after_sec"]:
-                    raise RuntimeError("scheduled reconnect")
+    async def run(self):
+        url = "wss://ws.okx.com:8443/ws/v5/public"
+        args = [{"channel": "trades", "instId": to_okx_inst_id(s)} for s in self.symbols]
 
-                raw = await asyncio.wait_for(ws.recv(), timeout=CONFIG["recv_timeout_sec"])
-                msg = json.loads(raw)
+        while True:
+            try:
+                logger.info("OKX connected")
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**23) as ws:
+                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
 
-                event = msg.get("event")
-                channel = msg.get("channel")
+                    async for raw in ws:
+                        msg = json.loads(raw)
 
-                if event == "subscribe":
-                    continue
+                        # 订阅事件
+                        if msg.get("event") in {"subscribe", "unsubscribe"}:
+                            continue
+                        if "arg" not in msg or "data" not in msg:
+                            continue
+                        if msg["arg"].get("channel") != "trades":
+                            continue
 
-                if channel != "spot.trades" or event != "update":
-                    continue
+                        for item in msg["data"]:
+                            inst_id = item["instId"]
+                            symbol = self.inst_id_to_unified(inst_id)
+                            price = float(item["px"])
+                            qty = float(item["sz"])
+                            notional = price * qty  # 近似值
+                            side = item["side"].upper()
+                            ts_ms = int(item["ts"])
 
-                result = msg.get("result", [])
-                if isinstance(result, dict):
-                    result = [result]
+                            ev = TradeEvent(
+                                exchange="OKX",
+                                symbol=symbol,
+                                side=side,
+                                price=price,
+                                qty=qty,
+                                notional_usdt=notional,
+                                ts_ms=ts_ms,
+                            )
+                            await self.detector.on_trade(ev)
+            except Exception as e:
+                logger.exception("OKX error: %s", e)
+                await asyncio.sleep(5)
 
-                for trade in result:
-                    pair = trade.get("currency_pair", "").replace("_", "").lower()
-                    if pair not in states:
-                        continue
+# =========================
+# MAIN
+# =========================
+async def main():
+    notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+    await notifier.start()
 
-                    price = float(trade["price"])
-                    size = float(trade["amount"])
-                    side = trade["side"].lower()
+    detector = SweepDetector(notifier)
 
-                    states[pair].add_trade(price, size, side, "gate")
+    monitors = [
+        BinanceMonitor(detector, USER_SYMBOLS),
+        BybitMonitor(detector, USER_SYMBOLS),
+        OkxMonitor(detector, USER_SYMBOLS),
+    ]
 
-        except Exception as e:
-            log(f"[GATE ERROR] {e}")
-
-        finally:
-            if ws is not None:
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-
-        log(f"[GATE] retry in {CONFIG['reconnect_delay_sec']}s")
-        await asyncio.sleep(CONFIG["reconnect_delay_sec"])
-
-
-async def alert_loop(states: Dict[str, SymbolState], tg: TelegramPusher, session: aiohttp.ClientSession) -> None:
-    while True:
-        await asyncio.sleep(1)
-
-        for state in states.values():
-            alerts = state.check_alerts()
-            for msg in alerts:
-                log("\n===== ALERT =====")
-                log(msg)
-                log("=================\n")
-                await tg.send(session, msg)
-
-
-async def heartbeat_loop(states: Dict[str, SymbolState]) -> None:
-    while True:
-        await asyncio.sleep(CONFIG["heartbeat_sec"])
-        rows = []
-        for symbol, state in states.items():
-            age = int(now_ts() - state.last_trade_ts) if state.last_trade_ts > 0 else -1
-            src = []
-            if state.binance_seen:
-                src.append("B")
-            if state.gate_seen:
-                src.append("G")
-            src_text = "".join(src) if src else "-"
-            rows.append(f"{symbol}:{age}s:{src_text}")
-
-        log(f"[HEARTBEAT] {time.strftime('%Y-%m-%d %H:%M:%S')} | {' | '.join(rows)}")
-
-
-async def main() -> None:
-    if not CONFIG["symbols"]:
-        raise RuntimeError("symbols is empty")
-
-    tg = TelegramPusher(CONFIG["telegram_bot_token"], CONFIG["telegram_chat_id"])
-    states = {s: SymbolState(s) for s in CONFIG["symbols"]}
-
-    timeout = aiohttp.ClientTimeout(total=None)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        await test_telegram(session, tg)
-        await test_gate_rest(session)
-
-        log(f"[INIT] Using symbols ({len(CONFIG['symbols'])}): {', '.join(CONFIG['symbols'])}")
-
-        tasks = [
-            asyncio.create_task(run_binance(states), name="binance"),
-            asyncio.create_task(run_gate(states), name="gate"),
-            asyncio.create_task(alert_loop(states, tg, session), name="alerts"),
-            asyncio.create_task(heartbeat_loop(states), name="heartbeat"),
-        ]
-
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-
-        for task in done:
-            exc = task.exception()
-            if exc:
-                log(f"[FATAL] task {task.get_name()} crashed: {exc}")
-
-        for task in pending:
-            task.cancel()
-
-        await asyncio.gather(*pending, return_exceptions=True)
-
+    logger.info("Start symbols: %s", ", ".join(USER_SYMBOLS))
+    try:
+        await asyncio.gather(*(m.run() for m in monitors))
+    finally:
+        await notifier.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("Stopped by user.")
+    asyncio.run(main())
