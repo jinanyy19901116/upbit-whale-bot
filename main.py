@@ -76,9 +76,6 @@ PRICE_FLAT_5M_PCT = float(os.getenv("PRICE_FLAT_5M_PCT", "0.004"))   # 0.4%
 # OI 状态阈值
 OI_FLAT_5M_PCT = float(os.getenv("OI_FLAT_5M_PCT", "0.005"))         # 0.5%
 
-# OKX instruments 刷新间隔
-OKX_CTVAL_REFRESH_SEC = int(os.getenv("OKX_CTVAL_REFRESH_SEC", "3600"))
-
 # 价格/OI 轮询间隔
 SNAPSHOT_POLL_SEC = int(os.getenv("SNAPSHOT_POLL_SEC", "20"))
 
@@ -115,16 +112,6 @@ def to_binance_symbol(sym: str) -> str:
 
 def to_bybit_symbol(sym: str) -> str:
     return sym.upper()
-
-def to_okx_inst_id(sym: str) -> str:
-    base = sym[:-4]
-    return f"{base}-USDT-SWAP"
-
-def okx_inst_id_to_unified(inst_id: str) -> str:
-    if inst_id.endswith("-USDT-SWAP"):
-        base = inst_id.replace("-USDT-SWAP", "")
-        return f"{base}USDT"
-    return inst_id.replace("-", "")
 
 def side_to_cn(side: str) -> str:
     return "买入" if side.upper() == "BUY" else "卖出"
@@ -253,7 +240,6 @@ class MarketState:
         ch1 = self.get_price_change_1m(exchange, symbol)
         ch5 = self.get_price_change_5m(exchange, symbol)
 
-        # 优先看 5m，再辅助看 1m
         if ch5 is not None:
             if ch5 >= PRICE_FLAT_5M_PCT:
                 return "上涨"
@@ -295,89 +281,11 @@ class MarketState:
         )
 
 # =========================
-# OKX CONTRACT CACHE
-# =========================
-class OkxContractSpecCache:
-    """
-    缓存：
-    1. instId -> ctVal
-    2. 有效 instId 集合
-    """
-    def __init__(self):
-        self.ctval_map: Dict[str, float] = {}
-        self.valid_inst_ids: set[str] = set()
-        self.session: Optional[aiohttp.ClientSession] = None
-
-    async def start(self):
-        if self.session is None:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-        await self.refresh()
-
-    async def close(self):
-        if self.session:
-            await self.session.close()
-
-    async def refresh(self):
-        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-        try:
-            async with self.session.get(url) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error("拉取 OKX instruments 失败: %s %s", resp.status, body)
-                    return
-
-                payload = await resp.json()
-                items = payload.get("data", [])
-
-                ctval_map: Dict[str, float] = {}
-                valid_inst_ids: set[str] = set()
-
-                for item in items:
-                    inst_id = item.get("instId")
-                    ct_val = item.get("ctVal")
-                    if not inst_id:
-                        continue
-                    valid_inst_ids.add(inst_id)
-
-                    try:
-                        if ct_val not in (None, ""):
-                            ctval_map[inst_id] = float(ct_val)
-                    except Exception:
-                        pass
-
-                self.valid_inst_ids = valid_inst_ids
-                if ctval_map:
-                    self.ctval_map = ctval_map
-
-                logger.info(
-                    "OKX instruments 已刷新，有效SWAP数量: %d, ctVal数量: %d",
-                    len(self.valid_inst_ids),
-                    len(self.ctval_map),
-                )
-        except Exception as e:
-            logger.exception("刷新 OKX instruments 异常: %s", e)
-
-    async def auto_refresh_loop(self):
-        while True:
-            await asyncio.sleep(OKX_CTVAL_REFRESH_SEC)
-            try:
-                await self.refresh()
-            except Exception as e:
-                logger.exception("OKX instruments 定时刷新异常: %s", e)
-
-    def get_ctval(self, inst_id: str) -> float:
-        return self.ctval_map.get(inst_id, 1.0)
-
-    def is_valid_inst_id(self, inst_id: str) -> bool:
-        return inst_id in self.valid_inst_ids
-
-# =========================
 # SNAPSHOT FETCHERS
 # =========================
 class SnapshotPoller:
-    def __init__(self, market_state: MarketState, okx_cache: OkxContractSpecCache):
+    def __init__(self, market_state: MarketState):
         self.market_state = market_state
-        self.okx_cache = okx_cache
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
@@ -390,8 +298,6 @@ class SnapshotPoller:
 
     # ---------- Binance ----------
     async def _poll_binance_symbol(self, symbol: str):
-        # price: premiumIndex
-        # oi: /fapi/v1/openInterest
         sym = symbol.upper()
         try:
             async with self.session.get(
@@ -414,7 +320,6 @@ class SnapshotPoller:
                     oi_contracts = float(data["openInterest"])
                     ts_ms = int(data.get("time", int(datetime.now(tz=timezone.utc).timestamp() * 1000)))
 
-                    # 近似转USDT：OI合约数 * 最新价格
                     price_dq = self.market_state.price_history.get(("BINANCE", sym))
                     if price_dq:
                         last_price = price_dq[-1][1]
@@ -479,59 +384,6 @@ class SnapshotPoller:
                     await self._poll_bybit_symbol(sym)
                 except Exception as e:
                     logger.debug("Bybit snapshot 异常 %s: %s", sym, e)
-            await asyncio.sleep(SNAPSHOT_POLL_SEC)
-
-    # ---------- OKX ----------
-    async def _poll_okx_symbol(self, symbol: str):
-        inst_id = to_okx_inst_id(symbol)
-        if not self.okx_cache.is_valid_inst_id(inst_id):
-            return
-
-        try:
-            async with self.session.get(
-                "https://www.okx.com/api/v5/market/ticker",
-                params={"instId": inst_id},
-            ) as resp:
-                if resp.status == 200:
-                    payload = await resp.json()
-                    lst = payload.get("data", [])
-                    if lst:
-                        item = lst[0]
-                        mark_price = float(item.get("last"))
-                        ts_ms = int(item.get("ts", int(datetime.now(tz=timezone.utc).timestamp() * 1000)))
-                        self.market_state.update_price("OKX", symbol.upper(), mark_price, ts_ms)
-        except Exception as e:
-            logger.debug("OKX price 拉取失败 %s: %s", symbol, e)
-
-        try:
-            async with self.session.get(
-                "https://www.okx.com/api/v5/public/open-interest",
-                params={"instType": "SWAP", "instId": inst_id},
-            ) as resp:
-                if resp.status == 200:
-                    payload = await resp.json()
-                    lst = payload.get("data", [])
-                    if lst:
-                        item = lst[0]
-                        oi_contracts = float(item.get("oi", 0))
-                        ts_ms = int(item.get("ts", int(datetime.now(tz=timezone.utc).timestamp() * 1000)))
-
-                        price_dq = self.market_state.price_history.get(("OKX", symbol.upper()))
-                        if price_dq:
-                            last_price = price_dq[-1][1]
-                            ct_val = self.okx_cache.get_ctval(inst_id)
-                            oi_usdt = oi_contracts * ct_val * last_price
-                            self.market_state.update_oi("OKX", symbol.upper(), oi_usdt, ts_ms)
-        except Exception as e:
-            logger.debug("OKX OI 拉取失败 %s: %s", symbol, e)
-
-    async def poll_okx_loop(self, symbols: List[str]):
-        while True:
-            for sym in symbols:
-                try:
-                    await self._poll_okx_symbol(sym)
-                except Exception as e:
-                    logger.debug("OKX snapshot 异常 %s: %s", sym, e)
             await asyncio.sleep(SNAPSHOT_POLL_SEC)
 
 # =========================
@@ -642,10 +494,6 @@ class LargeTradeDetector:
 
         market_text = self.market_state.get_snapshot_text(ev.exchange, ev.symbol)
 
-        extra = ""
-        if ev.exchange == "OKX" and ev.contract_multiplier is not None:
-            extra = f"\nOKX面值：{ev.contract_multiplier:g}"
-
         msg = (
             f"{emoji} 大额成交单\n"
             f"交易所：{ev.exchange}\n"
@@ -656,7 +504,6 @@ class LargeTradeDetector:
             f"数量：{ev.qty}\n"
             f"{market_text}\n"
             f"时间：{format_beijing_time(ev.ts_ms)}（北京时间）"
-            f"{extra}"
         )
 
         await self.notifier.send(msg)
@@ -773,97 +620,6 @@ class BybitMonitor:
                 await asyncio.sleep(5)
 
 # =========================
-# OKX
-# =========================
-class OkxMonitor:
-    def __init__(self, detector: LargeTradeDetector, market_state: MarketState, symbols: List[str], spec_cache: OkxContractSpecCache):
-        self.detector = detector
-        self.market_state = market_state
-        self.symbols = symbols
-        self.spec_cache = spec_cache
-
-    async def run(self):
-        url = "wss://ws.okx.com:8443/ws/v5/public"
-
-        while True:
-            try:
-                valid_args = []
-                invalid_symbols = []
-
-                for sym in self.symbols:
-                    inst_id = to_okx_inst_id(sym)
-                    if self.spec_cache.is_valid_inst_id(inst_id):
-                        valid_args.append({"channel": "trades", "instId": inst_id})
-                    else:
-                        invalid_symbols.append((sym, inst_id))
-
-                for sym, inst_id in invalid_symbols:
-                    logger.warning("OKX 不存在该永续合约，已跳过: %s -> %s", sym, inst_id)
-
-                if not valid_args:
-                    logger.warning("OKX 没有可订阅的有效合约，60秒后重试")
-                    await asyncio.sleep(60)
-                    continue
-
-                logger.info("OKX 已连接，有效订阅数: %d", len(valid_args))
-
-                async with websockets.connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    max_size=2**23
-                ) as ws:
-                    await ws.send(json.dumps({"op": "subscribe", "args": valid_args}))
-
-                    async for raw in ws:
-                        msg = json.loads(raw)
-
-                        if msg.get("event") in {"subscribe", "unsubscribe"}:
-                            continue
-
-                        if msg.get("event") == "error":
-                            logger.warning("OKX 订阅错误: %s", msg)
-                            continue
-
-                        if "arg" not in msg or "data" not in msg:
-                            continue
-                        if msg["arg"].get("channel") != "trades":
-                            continue
-
-                        for item in msg["data"]:
-                            inst_id = item["instId"]
-                            symbol = okx_inst_id_to_unified(inst_id)
-
-                            price = float(item["px"])
-                            contracts = float(item["sz"])
-                            ct_val = self.spec_cache.get_ctval(inst_id)
-
-                            qty_coin = contracts * ct_val
-                            notional = price * qty_coin
-
-                            side = item["side"].upper()
-                            ts_ms = int(item["ts"])
-
-                            self.market_state.update_price("OKX", symbol, price, ts_ms)
-
-                            ev = TradeEvent(
-                                exchange="OKX",
-                                symbol=symbol,
-                                side=side,
-                                price=price,
-                                qty=qty_coin,
-                                raw_qty=contracts,
-                                contract_multiplier=ct_val,
-                                notional_usdt=notional,
-                                ts_ms=ts_ms,
-                            )
-                            await self.detector.on_trade(ev)
-
-            except Exception as e:
-                logger.exception("OKX 异常: %s", e)
-                await asyncio.sleep(5)
-
-# =========================
 # MAIN
 # =========================
 async def main():
@@ -871,35 +627,28 @@ async def main():
     await notifier.start()
 
     market_state = MarketState()
-
-    okx_cache = OkxContractSpecCache()
-    await okx_cache.start()
-
     detector = LargeTradeDetector(notifier, market_state)
 
-    snapshot_poller = SnapshotPoller(market_state, okx_cache)
+    snapshot_poller = SnapshotPoller(market_state)
     await snapshot_poller.start()
 
     monitors = [
         BinanceMonitor(detector, market_state, USER_SYMBOLS),
         BybitMonitor(detector, market_state, USER_SYMBOLS),
-        OkxMonitor(detector, market_state, USER_SYMBOLS, okx_cache),
     ]
 
     logger.info("启动监控币种: %s", ", ".join(USER_SYMBOLS))
+    logger.info("当前仅启用交易所: BINANCE, BYBIT")
 
     try:
         await asyncio.gather(
-            okx_cache.auto_refresh_loop(),
             snapshot_poller.poll_binance_loop(USER_SYMBOLS),
             snapshot_poller.poll_bybit_loop(USER_SYMBOLS),
-            snapshot_poller.poll_okx_loop(USER_SYMBOLS),
             *(m.run() for m in monitors),
         )
     finally:
         await notifier.close()
         await snapshot_poller.close()
-        await okx_cache.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
