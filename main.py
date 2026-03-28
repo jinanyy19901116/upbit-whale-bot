@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="资金轮动监控器", version="0.7.0")
+app = FastAPI(title="资金轮动监控器", version="0.8.0")
 
 BINANCE_FAPI = "https://fapi.binance.com"
 BYBIT_API = "https://api.bybit.com"
@@ -43,6 +43,9 @@ DATABASE_URL = (os.getenv("DATABASE_URL", "") or "").strip()
 SNAPSHOT_LOOKBACK_MINUTES = int(os.getenv("SNAPSHOT_LOOKBACK_MINUTES", "60"))
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "90"))
 LEADER_LIMIT = int(os.getenv("LEADER_LIMIT", "50"))
+AUTO_SCAN_ENABLED = (os.getenv("AUTO_SCAN_ENABLED", "true") or "true").strip().lower() == "true"
+AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "300"))
+PORT = int(os.getenv("PORT", "8080"))
 
 SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
@@ -400,7 +403,7 @@ def score_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def gather_market_state(watchlist: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
-    headers = {"User-Agent": "rotation-scanner-cn/0.7.0"}
+    headers = {"User-Agent": "rotation-scanner-cn/0.8.0"}
 
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         tasks = {
@@ -432,57 +435,25 @@ def generate_trade_signal(row: Dict[str, Any]) -> str:
     ex_count = len(row.get("exchanges", []))
     signal_growth = safe_float(row.get("signal_growth_vs_baseline"))
 
-    if (
-        score >= 60
-        and vol >= 20
-        and oi >= 10
-        and 0 <= price < 25
-        and ex_count >= 2
-    ):
+    if score >= 60 and vol >= 20 and oi >= 10 and 0 <= price < 25 and ex_count >= 2:
         return "做多买入"
 
-    if (
-        score >= 55
-        and vol >= 10
-        and 0 <= price < 35
-        and ex_count >= 2
-    ):
+    if score >= 55 and vol >= 10 and 0 <= price < 35 and ex_count >= 2:
         return "做多观察"
 
-    if (
-        score >= 60
-        and vol >= 20
-        and oi >= 10
-        and -25 < price <= 0
-        and ex_count >= 2
-    ):
+    if score >= 60 and vol >= 20 and oi >= 10 and -25 < price <= 0 and ex_count >= 2:
         return "做空买入"
 
-    if (
-        score >= 55
-        and vol >= 10
-        and -35 < price <= 0
-        and ex_count >= 2
-    ):
+    if score >= 55 and vol >= 10 and -35 < price <= 0 and ex_count >= 2:
         return "做空观察"
 
-    if (
-        price > 60
-        or (price > 35 and (signal_growth < 0 or oi < 0))
-    ):
+    if price > 60 or (price > 35 and (signal_growth < 0 or oi < 0)):
         return "多单止盈"
 
-    if (
-        price < -60
-        or (price < -35 and (signal_growth > 0 or oi > 0))
-    ):
+    if price < -60 or (price < -35 and (signal_growth > 0 or oi > 0)):
         return "空单止盈"
 
-    if (
-        score < 40
-        or signal_growth <= -8
-        or (vol < -15 and oi < -10)
-    ):
+    if score < 40 or signal_growth <= -8 or (vol < -15 and oi < -10):
         return "止损"
 
     return "观望"
@@ -887,8 +858,12 @@ class Database:
 
         out = []
         for r in rows:
+            bucket_ts = r["bucket_ts"]
+            if bucket_ts and bucket_ts.tzinfo is None:
+                bucket_ts = bucket_ts.replace(tzinfo=timezone.utc)
+
             out.append({
-                "bucket_at": r["bucket_ts"].replace(tzinfo=timezone.utc).isoformat() if r["bucket_ts"] else None,
+                "bucket_at": bucket_ts.isoformat() if bucket_ts else None,
                 "exchange": r["exchange"],
                 "symbol": r["symbol"],
                 "open": round(safe_float(r["open_price"]), 8),
@@ -943,6 +918,10 @@ class Database:
 
         result = []
         for r in rows:
+            latest_snapshot_at = r["latest_snapshot_at"]
+            if latest_snapshot_at and latest_snapshot_at.tzinfo is None:
+                latest_snapshot_at = latest_snapshot_at.replace(tzinfo=timezone.utc)
+
             result.append({
                 "symbol": r["symbol"],
                 "exchanges": list(r["exchanges"] or []),
@@ -953,14 +932,18 @@ class Database:
                 "price_change_pct_24h_avg": round(float(r["price_change_pct_24h_avg"] or 0), 2),
                 "reasons": [x for x in (r["reasons"] or []) if x],
                 "market_types": sorted(set(x for x in (r["market_types"] or []) if x)),
-                "latest_snapshot_at": r["latest_snapshot_at"].isoformat() if r["latest_snapshot_at"] else None,
+                "latest_snapshot_at": latest_snapshot_at.isoformat() if latest_snapshot_at else None,
             })
         return result
 
     def _snapshot_row_to_dict(self, r: asyncpg.Record) -> Dict[str, Any]:
+        snapshot_at = r["snapshot_at"]
+        if snapshot_at and snapshot_at.tzinfo is None:
+            snapshot_at = snapshot_at.replace(tzinfo=timezone.utc)
+
         return {
             "id": int(r["id"]),
-            "snapshot_at": r["snapshot_at"].isoformat() if r["snapshot_at"] else None,
+            "snapshot_at": snapshot_at.isoformat() if snapshot_at else None,
             "exchange": r["exchange"],
             "symbol": r["symbol"],
             "market_type": r["market_type"],
@@ -979,18 +962,60 @@ class Database:
 
 
 db = Database(DATABASE_URL)
+background_scan_task: Optional[asyncio.Task] = None
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
-    ok = await db.connect()
-    if not ok:
-        logger.warning("主程序：数据库不可用。应用将继续运行，但不会使用 Postgres。错误=%s", db.last_error)
+def leader_fingerprint(row: Dict[str, Any]) -> str:
+    exchanges = ",".join(sorted(row["exchanges"]))
+    signal = row.get("交易信号", "观望")
+    score_bucket = int(safe_float(row["avg_signal_score"]) // 5)
+    return f"{row['symbol']}|{signal}|{exchanges}|{score_bucket}"
 
 
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    await db.close()
+def build_alert_text(candidates: List[Dict[str, Any]]) -> str:
+    if not candidates:
+        return ""
+
+    emoji_map = {
+        "做多买入": "🟢",
+        "做多观察": "🟡",
+        "做空买入": "🟣",
+        "做空观察": "🟠",
+        "多单止盈": "🔴",
+        "空单止盈": "🔵",
+        "止损": "⚫",
+        "观望": "⚪",
+    }
+
+    lines = [f"🚨 中文交易信号 {utc_now_iso()}"]
+    for row in candidates:
+        signal = row.get("交易信号", "观望")
+        emoji = emoji_map.get(signal, "⚪")
+        lines.append(
+            f"{emoji} {signal} {row['symbol']}\n"
+            f"评分={row['avg_signal_score']} | 交易所={','.join(row['exchanges'])}\n"
+            f"24h涨跌={row['price_change_pct_24h_avg']}% | "
+            f"量能变化={row.get('volume_growth_pct_vs_baseline')}% | "
+            f"OI变化={row.get('oi_growth_pct_vs_baseline')}% | "
+            f"评分变化={row.get('signal_growth_vs_baseline')}\n"
+        )
+
+    return "\n".join(lines)
+
+
+def build_telegram_test_text(note: Optional[str] = None) -> str:
+    lines = [
+        "🧪 Telegram 测试消息",
+        f"应用: {app.title}",
+        f"版本: {app.version}",
+        f"时间: {utc_now_iso()}",
+        f"watchlist_count: {len(WATCHLIST)}",
+        f"database_configured: {bool(DATABASE_URL)}",
+        f"telegram_configured: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}",
+    ]
+    if note:
+        lines.append(f"备注: {note}")
+    return "\n".join(lines)
 
 
 def enrich_with_history(
@@ -1072,12 +1097,7 @@ def build_alert_candidates(leaders: List[Dict[str, Any]]) -> List[Dict[str, Any]
         "观望": 99,
     }
 
-    out.sort(
-        key=lambda x: (
-            priority.get(x.get("交易信号", "观望"), 99),
-            -x["avg_signal_score"],
-        )
-    )
+    out.sort(key=lambda x: (priority.get(x.get("交易信号", "观望"), 99), -x["avg_signal_score"]))
     return out[:8]
 
 
@@ -1092,65 +1112,15 @@ async def send_telegram_message(client: httpx.AsyncClient, text: str) -> Tuple[b
         "disable_web_page_preview": True,
     }
 
-    resp = await client.post(url, json=payload)
     try:
-        data = resp.json()
-    except Exception:
-        data = {"raw_text": resp.text}
-    return resp.is_success, data
-
-
-def leader_fingerprint(row: Dict[str, Any]) -> str:
-    exchanges = ",".join(sorted(row["exchanges"]))
-    signal = row.get("交易信号", "观望")
-    score_bucket = int(safe_float(row["avg_signal_score"]) // 5)
-    return f"{row['symbol']}|{signal}|{exchanges}|{score_bucket}"
-
-
-def build_alert_text(candidates: List[Dict[str, Any]]) -> str:
-    if not candidates:
-        return ""
-
-    emoji_map = {
-        "做多买入": "🟢",
-        "做多观察": "🟡",
-        "做空买入": "🟣",
-        "做空观察": "🟠",
-        "多单止盈": "🔴",
-        "空单止盈": "🔵",
-        "止损": "⚫",
-        "观望": "⚪",
-    }
-
-    lines = [f"🚨 中文交易信号 {utc_now_iso()}"]
-    for row in candidates:
-        signal = row.get("交易信号", "观望")
-        emoji = emoji_map.get(signal, "⚪")
-        lines.append(
-            f"{emoji} {signal} {row['symbol']}\n"
-            f"评分={row['avg_signal_score']} | 交易所={','.join(row['exchanges'])}\n"
-            f"24h涨跌={row['price_change_pct_24h_avg']}% | "
-            f"量能变化={row.get('volume_growth_pct_vs_baseline')}% | "
-            f"OI变化={row.get('oi_growth_pct_vs_baseline')}% | "
-            f"评分变化={row.get('signal_growth_vs_baseline')}\n"
-        )
-
-    return "\n".join(lines)
-
-
-def build_telegram_test_text(note: Optional[str] = None) -> str:
-    lines = [
-        "🧪 Telegram 测试消息",
-        f"应用: {app.title}",
-        f"版本: {app.version}",
-        f"时间: {utc_now_iso()}",
-        f"watchlist_count: {len(WATCHLIST)}",
-        f"database_configured: {bool(DATABASE_URL)}",
-        f"telegram_configured: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}",
-    ]
-    if note:
-        lines.append(f"备注: {note}")
-    return "\n".join(lines)
+        resp = await client.post(url, json=payload)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_text": resp.text}
+        return resp.is_success, data
+    except Exception as e:
+        return False, {"error": f"{type(e).__name__}: {e}"}
 
 
 async def scan_once(save: bool = True) -> Dict[str, Any]:
@@ -1189,11 +1159,66 @@ async def scan_once(save: bool = True) -> Dict[str, Any]:
     }
 
 
+async def periodic_scan_loop() -> None:
+    logger.info(
+        "自动扫描任务启动 enabled=%s interval=%ss",
+        AUTO_SCAN_ENABLED,
+        AUTO_SCAN_INTERVAL_SECONDS,
+    )
+
+    while True:
+        try:
+            payload = await scan_once(save=True)
+            logger.info(
+                "自动扫描完成 generated_at=%s alert_candidates=%s",
+                payload.get("generated_at"),
+                len(payload.get("alert_candidates", [])),
+            )
+        except asyncio.CancelledError:
+            logger.info("自动扫描任务已取消")
+            raise
+        except Exception:
+            logger.exception("自动扫描任务执行失败")
+
+        await asyncio.sleep(max(30, AUTO_SCAN_INTERVAL_SECONDS))
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    global background_scan_task
+
+    ok = await db.connect()
+    if not ok:
+        logger.warning("主程序：数据库不可用。应用将继续运行，但不会使用 Postgres。错误=%s", db.last_error)
+
+    if AUTO_SCAN_ENABLED:
+        background_scan_task = asyncio.create_task(periodic_scan_loop())
+        logger.info("已创建自动扫描后台任务")
+    else:
+        logger.info("自动扫描已关闭")
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    global background_scan_task
+
+    if background_scan_task:
+        background_scan_task.cancel()
+        try:
+            await background_scan_task
+        except asyncio.CancelledError:
+            pass
+        background_scan_task = None
+
+    await db.close()
+
+
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
         "name": app.title,
         "version": app.version,
+        "port": PORT,
         "watchlist_count": len(WATCHLIST),
         "history_enabled": bool(db.pool),
         "database_configured": bool(DATABASE_URL),
@@ -1231,6 +1256,8 @@ async def health() -> Dict[str, Any]:
         "database_error": db.last_error,
         "upbit_region": UPBIT_REGION,
         "upbit_quote": UPBIT_QUOTE,
+        "auto_scan_enabled": AUTO_SCAN_ENABLED,
+        "auto_scan_interval_seconds": AUTO_SCAN_INTERVAL_SECONDS,
         "now": utc_now_iso(),
     }
 
@@ -1252,6 +1279,9 @@ async def history_status() -> Dict[str, Any]:
     async with db.pool.acquire() as conn:
         count = await conn.fetchval("SELECT COUNT(*) FROM snapshots")
         latest = await conn.fetchval("SELECT MAX(snapshot_at) FROM snapshots")
+
+    if latest and latest.tzinfo is None:
+        latest = latest.replace(tzinfo=timezone.utc)
 
     return {
         "history_enabled": True,
@@ -1312,10 +1342,8 @@ async def history_symbol(
             limit=limit,
         )
         if not rows:
-            raise HTTPException(
-                status_code=404,
-                detail=f"未找到 {symbol} 的聚合历史数据",
-            )
+            raise HTTPException(status_code=404, detail=f"未找到 {symbol} 的聚合历史数据")
+
         return JSONResponse({
             "history_enabled": True,
             "symbol": symbol,
@@ -1336,13 +1364,7 @@ async def history_symbol(
     )
 
     if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"未找到 {symbol} 的历史快照数据",
-        )
-
-    latest = rows[-1]
-    first = rows[0]
+        raise HTTPException(status_code=404, detail=f"未找到 {symbol} 的历史快照数据")
 
     return JSONResponse({
         "history_enabled": True,
@@ -1350,8 +1372,8 @@ async def history_symbol(
         "exchange": exchange,
         "minutes": minutes,
         "count": len(rows),
-        "first_snapshot_at": first["snapshot_at"],
-        "latest_snapshot_at": latest["snapshot_at"],
+        "first_snapshot_at": rows[0]["snapshot_at"],
+        "latest_snapshot_at": rows[-1]["snapshot_at"],
         "rows": rows,
     })
 
@@ -1394,10 +1416,7 @@ async def scan(
                     exact.append({"exchange": ex, **row})
 
         if not exact:
-            raise HTTPException(
-                status_code=404,
-                detail=f"未在监控列表或当前交易所结果中找到 {symbol}",
-            )
+            raise HTTPException(status_code=404, detail=f"未在监控列表或当前交易所结果中找到 {symbol}")
 
         exact.sort(key=lambda x: x["signal_score"], reverse=True)
         return JSONResponse({
