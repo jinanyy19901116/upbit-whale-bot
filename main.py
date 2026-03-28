@@ -53,7 +53,7 @@ RAW_SYMBOLS = [
 ]
 
 # 大额成交阈值
-SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "100000"))
+SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "200000"))
 
 # 同交易所+同合约+同方向 冷却
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "15"))
