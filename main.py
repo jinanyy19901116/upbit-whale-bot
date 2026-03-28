@@ -1,11 +1,10 @@
-# main.py
 import asyncio
 import json
 import logging
 import os
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from typing import Deque, Dict, List, Tuple
 
 import aiohttp
@@ -18,7 +17,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in environment variables")
+    raise RuntimeError("缺少 TELEGRAM_TOKEN 或 TELEGRAM_CHAT_ID 环境变量")
 
 # =========================
 # USER CONFIG
@@ -53,12 +52,17 @@ RAW_SYMBOLS = [
     "avausdt",
 ]
 
-# 阈值可在 Railway 环境变量里覆盖
+# 单笔大额成交阈值
 SINGLE_TRADE_USDT = float(os.getenv("SINGLE_TRADE_USDT", "100000"))
-SWEEP_WINDOW_SEC = float(os.getenv("SWEEP_WINDOW_SEC", "5"))
-SWEEP_TOTAL_USDT = float(os.getenv("SWEEP_TOTAL_USDT", "300000"))
-SWEEP_MIN_TRADES = int(os.getenv("SWEEP_MIN_TRADES", "3"))
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "20"))
+
+# 同方向同金额告警冷却，避免重复推送
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "15"))
+
+# 机器人刷单过滤参数
+BOT_WINDOW_SEC = float(os.getenv("BOT_WINDOW_SEC", "3"))
+BOT_MIN_COUNT = int(os.getenv("BOT_MIN_COUNT", "4"))
+BOT_NOTIONAL_DIFF_RATIO = float(os.getenv("BOT_NOTIONAL_DIFF_RATIO", "0.005"))  # 0.5%
+BOT_PRICE_DIFF_RATIO = float(os.getenv("BOT_PRICE_DIFF_RATIO", "0.0005"))      # 0.05%
 
 # =========================
 # LOGGING
@@ -70,15 +74,20 @@ logging.basicConfig(
 logger = logging.getLogger("whale-monitor")
 
 # =========================
-# NORMALIZATION HELPERS
+# HELPERS
 # =========================
+CN_TZ = timezone(timedelta(hours=8))
+
+def format_beijing_time(ts_ms: int) -> str:
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(CN_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 def normalize_user_symbols(raw: List[str]) -> List[str]:
     out = []
     for s in raw:
         s = s.strip().upper()
-        if not s.endswith("USDT"):
-            continue
-        out.append(s)
+        if s.endswith("USDT"):
+            out.append(s)
     return out
 
 USER_SYMBOLS = normalize_user_symbols(RAW_SYMBOLS)
@@ -92,6 +101,9 @@ def to_bybit_symbol(sym: str) -> str:
 def to_okx_inst_id(sym: str) -> str:
     base = sym[:-4]
     return f"{base}-USDT-SWAP"
+
+def side_to_cn(side: str) -> str:
+    return "买入" if side.upper() == "BUY" else "卖出"
 
 # =========================
 # TELEGRAM
@@ -125,9 +137,9 @@ class TelegramNotifier:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error("Telegram send failed: %s %s", resp.status, body)
+                    logger.error("Telegram 发送失败: %s %s", resp.status, body)
         except Exception as e:
-            logger.exception("Telegram error: %s", e)
+            logger.exception("Telegram 异常: %s", e)
 
 # =========================
 # EVENT MODEL
@@ -135,98 +147,104 @@ class TelegramNotifier:
 @dataclass
 class TradeEvent:
     exchange: str
-    symbol: str            # unified, e.g. SIGNUSDT
-    side: str              # BUY / SELL
+    symbol: str
+    side: str
     price: float
     qty: float
     notional_usdt: float
     ts_ms: int
 
 # =========================
-# DETECTOR
+# BOT FILTER + LARGE TRADE DETECTOR
 # =========================
-class SweepDetector:
+class LargeTradeDetector:
     def __init__(self, notifier: TelegramNotifier):
         self.notifier = notifier
-        self.buffers: Dict[Tuple[str, str, str], Deque[TradeEvent]] = defaultdict(deque)
-        self.last_alert_at: Dict[Tuple[str, str, str, str], float] = {}
+        self.last_alert_at: Dict[Tuple[str, str, str], float] = {}
+        self.recent_trades: Dict[Tuple[str, str, str], Deque[TradeEvent]] = defaultdict(deque)
 
     async def on_trade(self, ev: TradeEvent):
-        await self._maybe_alert_single(ev)
-        await self._maybe_alert_sweep(ev)
-
-    async def _maybe_alert_single(self, ev: TradeEvent):
         if ev.notional_usdt < SINGLE_TRADE_USDT:
             return
 
-        key = (ev.exchange, ev.symbol, ev.side, "single")
-        now = time.time()
-        if now - self.last_alert_at.get(key, 0) < ALERT_COOLDOWN_SEC:
+        if self._is_bot_like(ev):
+            logger.info(
+                "过滤疑似机器人刷单 | %s | %s | %s | %.0f",
+                ev.exchange, ev.symbol, ev.side, ev.notional_usdt
+            )
             return
-        self.last_alert_at[key] = now
 
-        emoji = "🟢" if ev.side == "BUY" else "🔴"
-        msg = (
-            f"{emoji} 大额成交\n"
-            f"交易所: {ev.exchange}\n"
-            f"合约: {ev.symbol}\n"
-            f"方向: {ev.side}\n"
-            f"金额: {ev.notional_usdt:,.0f} USDT\n"
-            f"价格: {ev.price}\n"
-            f"数量: {ev.qty}\n"
-            f"时间: {ev.ts_ms}"
-        )
-        await self.notifier.send(msg)
-        logger.info("single alert | %s | %s | %s | %.0f", ev.exchange, ev.symbol, ev.side, ev.notional_usdt)
+        await self._alert_large_trade(ev)
 
-    async def _maybe_alert_sweep(self, ev: TradeEvent):
+    def _is_bot_like(self, ev: TradeEvent) -> bool:
+        """
+        过滤逻辑：
+        在短时间内，如果同交易所、同合约、同方向，
+        出现多笔金额极接近、价格极接近的大单，判定为疑似机器人刷单，不推送。
+        """
         key = (ev.exchange, ev.symbol, ev.side)
-        dq = self.buffers[key]
+        dq = self.recent_trades[key]
         dq.append(ev)
 
-        cutoff = ev.ts_ms - int(SWEEP_WINDOW_SEC * 1000)
+        cutoff = ev.ts_ms - int(BOT_WINDOW_SEC * 1000)
         while dq and dq[0].ts_ms < cutoff:
             dq.popleft()
 
-        total = sum(x.notional_usdt for x in dq)
-        count = len(dq)
+        if len(dq) < BOT_MIN_COUNT:
+            return False
 
-        if total < SWEEP_TOTAL_USDT or count < SWEEP_MIN_TRADES:
+        notionals = [x.notional_usdt for x in dq]
+        prices = [x.price for x in dq]
+
+        max_notional = max(notionals)
+        min_notional = min(notionals)
+        max_price = max(prices)
+        min_price = min(prices)
+
+        notional_ratio = (max_notional - min_notional) / max(min_notional, 1)
+        price_ratio = (max_price - min_price) / max(min_price, 1)
+
+        # 短时间内多笔高度相似成交，疑似程序刷量或拆单刷屏
+        if notional_ratio <= BOT_NOTIONAL_DIFF_RATIO and price_ratio <= BOT_PRICE_DIFF_RATIO:
+            return True
+
+        return False
+
+    async def _alert_large_trade(self, ev: TradeEvent):
+        key = (ev.exchange, ev.symbol, ev.side)
+        now_ts = ev.ts_ms / 1000
+
+        last_ts = self.last_alert_at.get(key, 0)
+        if now_ts - last_ts < ALERT_COOLDOWN_SEC:
             return
 
-        alert_key = (ev.exchange, ev.symbol, ev.side, "sweep")
-        now = time.time()
-        if now - self.last_alert_at.get(alert_key, 0) < ALERT_COOLDOWN_SEC:
-            return
-        self.last_alert_at[alert_key] = now
+        self.last_alert_at[key] = now_ts
 
-        first_ts = dq[0].ts_ms
-        last_ts = dq[-1].ts_ms
-        seconds = max((last_ts - first_ts) / 1000, 0.001)
+        side_cn = side_to_cn(ev.side)
+        emoji = "🟢" if ev.side == "BUY" else "🔴"
 
-        emoji = "🚀" if ev.side == "BUY" else "💥"
         msg = (
-            f"{emoji} 连续扫单\n"
-            f"交易所: {ev.exchange}\n"
-            f"合约: {ev.symbol}\n"
-            f"方向: {ev.side}\n"
-            f"窗口: {seconds:.2f}s\n"
-            f"笔数: {count}\n"
-            f"累计金额: {total:,.0f} USDT\n"
-            f"最新价格: {ev.price}\n"
-            f"单笔阈值: {SINGLE_TRADE_USDT:,.0f} / "
-            f"扫单阈值: {SWEEP_TOTAL_USDT:,.0f}"
+            f"{emoji} 大额成交单\n"
+            f"交易所：{ev.exchange}\n"
+            f"合约：{ev.symbol}\n"
+            f"方向：{side_cn}\n"
+            f"金额：{ev.notional_usdt:,.0f} USDT\n"
+            f"价格：{ev.price}\n"
+            f"数量：{ev.qty}\n"
+            f"时间：{format_beijing_time(ev.ts_ms)}（北京时间）"
         )
+
         await self.notifier.send(msg)
-        logger.info("sweep alert | %s | %s | %s | count=%d total=%.0f", ev.exchange, ev.symbol, ev.side, count, total)
+        logger.info(
+            "推送大额成交 | %s | %s | %s | %.0f",
+            ev.exchange, ev.symbol, side_cn, ev.notional_usdt
+        )
 
 # =========================
 # BINANCE
-# docs: <symbol>@aggTrade, lowercase symbols; combined streams supported.
-# buyer maker(m=true) => taker SELL, else BUY
 # =========================
 class BinanceMonitor:
-    def __init__(self, detector: SweepDetector, symbols: List[str]):
+    def __init__(self, detector: LargeTradeDetector, symbols: List[str]):
         self.detector = detector
         self.symbols = symbols
 
@@ -236,7 +254,7 @@ class BinanceMonitor:
 
         while True:
             try:
-                logger.info("Binance connected")
+                logger.info("Binance 已连接")
                 async with websockets.connect(url, ping_interval=150, ping_timeout=30, max_size=2**23) as ws:
                     async for raw in ws:
                         msg = json.loads(raw)
@@ -262,15 +280,14 @@ class BinanceMonitor:
                         )
                         await self.detector.on_trade(ev)
             except Exception as e:
-                logger.exception("Binance error: %s", e)
+                logger.exception("Binance 异常: %s", e)
                 await asyncio.sleep(5)
 
 # =========================
 # BYBIT
-# docs: publicTrade.{symbol}; S is taker side Buy/Sell
 # =========================
 class BybitMonitor:
-    def __init__(self, detector: SweepDetector, symbols: List[str]):
+    def __init__(self, detector: LargeTradeDetector, symbols: List[str]):
         self.detector = detector
         self.symbols = symbols
 
@@ -280,17 +297,16 @@ class BybitMonitor:
 
         while True:
             try:
-                logger.info("Bybit connected")
+                logger.info("Bybit 已连接")
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**23) as ws:
-                    sub = {"op": "subscribe", "args": topics}
-                    await ws.send(json.dumps(sub))
+                    await ws.send(json.dumps({"op": "subscribe", "args": topics}))
 
                     async for raw in ws:
                         msg = json.loads(raw)
 
-                        # 订阅错误 / 非数据消息
                         if msg.get("op") == "subscribe":
                             continue
+
                         topic = msg.get("topic", "")
                         data = msg.get("data", [])
                         if not topic.startswith("publicTrade.") or not data:
@@ -315,24 +331,19 @@ class BybitMonitor:
                             )
                             await self.detector.on_trade(ev)
             except Exception as e:
-                logger.exception("Bybit error: %s", e)
+                logger.exception("Bybit 异常: %s", e)
                 await asyncio.sleep(5)
 
 # =========================
 # OKX
-# docs: public WS channel "trades", instrument IDs like BTC-USDT-SWAP
-# side field is taker side buy/sell
-# 注意: sz 是合约张数，不同币种合约面值不同；这里用 px * sz 近似 USDT 名义金额
-# 若你后续要更精确，需要再接 instruments 接口换算 ctVal
 # =========================
 class OkxMonitor:
-    def __init__(self, detector: SweepDetector, symbols: List[str]):
+    def __init__(self, detector: LargeTradeDetector, symbols: List[str]):
         self.detector = detector
         self.symbols = symbols
 
     @staticmethod
     def inst_id_to_unified(inst_id: str) -> str:
-        # SIGN-USDT-SWAP -> SIGNUSDT
         if inst_id.endswith("-USDT-SWAP"):
             base = inst_id.replace("-USDT-SWAP", "")
             return f"{base}USDT"
@@ -344,14 +355,13 @@ class OkxMonitor:
 
         while True:
             try:
-                logger.info("OKX connected")
+                logger.info("OKX 已连接")
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**23) as ws:
                     await ws.send(json.dumps({"op": "subscribe", "args": args}))
 
                     async for raw in ws:
                         msg = json.loads(raw)
 
-                        # 订阅事件
                         if msg.get("event") in {"subscribe", "unsubscribe"}:
                             continue
                         if "arg" not in msg or "data" not in msg:
@@ -379,7 +389,7 @@ class OkxMonitor:
                             )
                             await self.detector.on_trade(ev)
             except Exception as e:
-                logger.exception("OKX error: %s", e)
+                logger.exception("OKX 异常: %s", e)
                 await asyncio.sleep(5)
 
 # =========================
@@ -389,7 +399,7 @@ async def main():
     notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
     await notifier.start()
 
-    detector = SweepDetector(notifier)
+    detector = LargeTradeDetector(notifier)
 
     monitors = [
         BinanceMonitor(detector, USER_SYMBOLS),
@@ -397,7 +407,7 @@ async def main():
         OkxMonitor(detector, USER_SYMBOLS),
     ]
 
-    logger.info("Start symbols: %s", ", ".join(USER_SYMBOLS))
+    logger.info("启动监控币种: %s", ", ".join(USER_SYMBOLS))
     try:
         await asyncio.gather(*(m.run() for m in monitors))
     finally:
