@@ -1,961 +1,927 @@
+# -*- coding: utf-8 -*-
+"""
+WebSocket 关键信号过滤版
+- Gate + MEXC
+- 监控 SIREN + 相似 30 个币
+- 规避套利机器人 / 对冲 / 做市噪音
+- Telegram 推送关键 LONG / SHORT
+
+依赖:
+  pip install aiohttp websockets protobuf
+
+环境变量:
+  TELEGRAM_BOT_TOKEN=xxx
+  TELEGRAM_CHAT_ID=xxx
+"""
+
 import os
 import json
 import time
+import math
 import asyncio
-import logging
-from collections import defaultdict, deque
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from collections import deque
+from typing import Dict, List, Tuple, Optional
 
-import httpx
+import aiohttp
 import websockets
-from fastapi import FastAPI
 
-# =========================================================
-# 基础配置
-# =========================================================
+# ======= MEXC protobuf（需你自行生成）=======
+try:
+    import PushDataV3ApiWrapper_pb2
+    import PublicAggreDealsV3Api_pb2
+    import PublicAggreDepthsV3Api_pb2
+    MEXC_PROTO_READY = True
+except Exception:
+    MEXC_PROTO_READY = False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s"
-)
-logger = logging.getLogger("main")
+# ============================================
+# 配置
+# ============================================
 
-# =========================================================
-# 环境变量
-# =========================================================
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-PORT = int(os.getenv("PORT", "8080"))
-AUTO_SCAN_ENABLED = os.getenv("AUTO_SCAN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+GATE_REST = "https://api.gateio.ws/api/v4"
+GATE_WS = "wss://api.gateio.ws/ws/v4/"
 
-ENABLE_GATE = os.getenv("ENABLE_GATE", "true").lower() in ("1", "true", "yes", "on")
-ENABLE_MEXC = os.getenv("ENABLE_MEXC", "true").lower() in ("1", "true", "yes", "on")
+MEXC_REST = "https://api.mexc.com"
+MEXC_WS = "wss://wbs-api.mexc.com/ws"
 
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+SEED_GATE = "SIREN_USDT"
+SEED_MEXC = "SIRENUSDT"
 
-# =========================================================
-# 监控币名单
-# =========================================================
+SIMILAR_COUNT = 30
+TOP_N_ORDERBOOK = 20
+COOLDOWN_SEC = 1800
+CANDIDATE_EXPIRE_SEC = 12
+MEXC_MAX_SUBS_PER_CONN = 30
 
-RAW_WATCHLIST = [
-    "SIGNUSDT", "KITEUSDT", "HYPEUSDT", "SIRNUSDT", "PHAUSDT", "POWERUSDT",
-    "SKYAIUSDT", "BARDUSDT", "QUSDT", "UAIUSDT", "HUSDT", "ICXUSDT",
-    "ROBOUSDT", "OGNUSDT", "XAIUSDT", "IPUSDT", "XAGUSDT", "GUSDT",
-    "ANKRUSDT", "ANIMEUSDT", "BANUSDT", "GUNUSDT", "ZROUSDT", "CUSDT",
-    "LIGHTUSDT", "CVCUSDT", "AVAUSDT",
-]
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
-# =========================================================
-# 信号参数
-# =========================================================
+# ============================================
+# 数据结构
+# ============================================
 
-# 单笔成交额达到这个值，视为大单
-LARGE_TRADE_USDT = float(os.getenv("LARGE_TRADE_USDT", "20000"))
+@dataclass
+class TradeTick:
+    ts: float
+    price: float
+    amount: float
+    side: str   # buy / sell
 
-# 最近窗口 & 基线窗口
-RECENT_WINDOW_MINUTES = int(os.getenv("RECENT_WINDOW_MINUTES", "3"))
-BASELINE_WINDOW_MINUTES = int(os.getenv("BASELINE_WINDOW_MINUTES", "15"))
-CACHE_KEEP_MINUTES = int(os.getenv("CACHE_KEEP_MINUTES", "30"))
 
-# 最近窗口最少成交额，否则不判信号
-MIN_RECENT_NOTIONAL_USDT = float(os.getenv("MIN_RECENT_NOTIONAL_USDT", "50000"))
+@dataclass
+class BookState:
+    bids: List[Tuple[float, float]] = field(default_factory=list)
+    asks: List[Tuple[float, float]] = field(default_factory=list)
+    ts: float = 0.0
 
-# 判定阈值
-ACTIVITY_RATIO_THRESHOLD = float(os.getenv("ACTIVITY_RATIO_THRESHOLD", "2.5"))
-BUY_SELL_IMBALANCE_THRESHOLD = float(os.getenv("BUY_SELL_IMBALANCE_THRESHOLD", "1.8"))
-LARGE_ORDER_IMBALANCE_THRESHOLD = float(os.getenv("LARGE_ORDER_IMBALANCE_THRESHOLD", "1.5"))
-ORDERBOOK_IMBALANCE_THRESHOLD = float(os.getenv("ORDERBOOK_IMBALANCE_THRESHOLD", "1.3"))
 
-# 同交易所 + 同币 + 同方向 的冷却时间
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "7200"))
+@dataclass
+class CandidateSignal:
+    direction: str                 # LONG / SHORT
+    created_ts: float
+    initial_score: float
+    reasons: List[str] = field(default_factory=list)
 
-# =========================================================
+
+@dataclass
+class SymbolState:
+    exchange: str
+    symbol: str
+    trades: deque = field(default_factory=lambda: deque(maxlen=8000))
+    prices: deque = field(default_factory=lambda: deque(maxlen=1200))  # (ts, price)
+    book: BookState = field(default_factory=BookState)
+    last_signal_ts: Dict[str, float] = field(default_factory=dict)
+    direction_marks: deque = field(default_factory=lambda: deque(maxlen=40))  # (ts, dir_int)
+    candidate: Optional[CandidateSignal] = None
+
+
+# ============================================
 # 工具函数
-# =========================================================
+# ============================================
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def now() -> float:
+    return time.time()
 
-def utc_now_iso() -> str:
-    return utc_now().isoformat()
 
-def beijing_now() -> datetime:
-    return utc_now().astimezone(timezone(timedelta(hours=8)))
-
-def beijing_now_str() -> str:
-    return beijing_now().strftime("%Y-%m-%d %H:%M:%S")
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-def split_usdt_pair(symbol: str) -> str:
-    s = symbol.strip().upper()
-    if not s.endswith("USDT"):
-        raise ValueError(f"watchlist symbol must end with USDT: {symbol}")
-    return s[:-4]
-
-def to_internal_symbol(base: str) -> str:
-    return f"{base}USDT"
-
-def gate_contract(base: str) -> str:
-    return f"{base}_USDT"
-
-def mexc_contract(base: str) -> str:
-    return f"{base}_USDT"
-
-def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+def safe_float(x, default=0.0) -> float:
     try:
-        if value is None or value == "":
-            return default
-        return float(value)
+        return float(x)
     except Exception:
         return default
 
-def format_number(x: Optional[float], digits: int = 4) -> str:
-    if x is None:
-        return "无"
-    try:
-        return f"{x:.{digits}f}"
-    except Exception:
-        return str(x)
 
-def format_volume(x: Optional[float]) -> str:
-    if x is None:
-        return "无"
-    ax = abs(x)
-    if ax >= 1_000_000_000:
-        return f"{x / 1_000_000_000:.2f}B"
-    if ax >= 1_000_000:
-        return f"{x / 1_000_000:.2f}M"
-    if ax >= 1_000:
-        return f"{x / 1_000:.2f}K"
-    return f"{x:.2f}"
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
-WATCHLIST_BASES = [split_usdt_pair(x) for x in RAW_WATCHLIST]
-WATCHLIST_BASE_SET = set(WATCHLIST_BASES)
 
-GATE_SYMBOLS = [gate_contract(x) for x in WATCHLIST_BASES]
-MEXC_SYMBOLS = [mexc_contract(x) for x in WATCHLIST_BASES]
+def pct(a: float, b: float) -> float:
+    if a == 0:
+        return 0.0
+    return (b - a) / a
 
-# =========================================================
-# 全局状态
-# =========================================================
 
-# market_state["gate:SIGN_USDT"] = {...}
-market_state: Dict[str, Dict[str, Any]] = {}
+def mean(xs: List[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
 
-# orderbook_state["gate:SIGN_USDT"] = {"bids":[(p,s)], "asks":[(p,s)], "ts_ms": ...}
-orderbook_state: Dict[str, Dict[str, Any]] = {}
 
-# trade_cache["gate:SIGN_USDT"] = deque([...])
-trade_cache: Dict[str, deque] = defaultdict(lambda: deque(maxlen=12000))
+def sign(x: float) -> int:
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
 
-# 防重复推送
-last_alert_sent_at: Dict[str, float] = {}
 
-# 后台任务
-_bg_tasks: List[asyncio.Task] = []
+def chunked(items, n):
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
 
-# =========================================================
-# 数据结构
-# =========================================================
 
-def market_key(exchange: str, raw_symbol: str) -> str:
-    return f"{exchange}:{raw_symbol}"
-
-def base_from_raw_symbol(exchange: str, raw_symbol: str) -> Optional[str]:
-    rs = raw_symbol.upper()
-    if rs.endswith("_USDT"):
-        return rs[:-5]
-    return None
-
-def make_market_item(
-    *,
-    exchange: str,
-    raw_symbol: str,
-    last_price: Optional[float] = None,
-    volume_24h: Optional[float] = None,
-    open_interest: Optional[float] = None,
-    funding_rate: Optional[float] = None,
-) -> Dict[str, Any]:
-    base = base_from_raw_symbol(exchange, raw_symbol)
-    return {
-        "exchange": exchange,
-        "market_type": "futures",
-        "raw_symbol": raw_symbol,
-        "base": base,
-        "symbol": to_internal_symbol(base) if base else raw_symbol,
-        "last_price": last_price,
-        "volume_24h": volume_24h,
-        "open_interest": open_interest,
-        "funding_rate": funding_rate,
-        "updated_at": utc_now_iso(),
-    }
-
-def make_trade_record(
-    *,
-    exchange: str,
-    raw_symbol: str,
-    price: float,
-    size: float,
-    side: str,
-    ts_ms: int,
-) -> Dict[str, Any]:
-    return {
-        "exchange": exchange,
-        "raw_symbol": raw_symbol,
-        "price": price,
-        "size": size,
-        "side": side,  # buy / sell / unknown
-        "notional": (price or 0.0) * (size or 0.0),
-        "ts_ms": ts_ms,
-    }
-
-def prune_trade_cache(records: deque, current_ms: int, keep_minutes: int = CACHE_KEEP_MINUTES) -> None:
-    min_ts = current_ms - keep_minutes * 60 * 1000
-    while records and records[0]["ts_ms"] < min_ts:
-        records.popleft()
-
-# =========================================================
-# 信号计算
-# =========================================================
-
-def calc_trade_flow_stats(records: List[Dict[str, Any]], current_ms: int) -> Dict[str, Any]:
-    recent_start = current_ms - RECENT_WINDOW_MINUTES * 60 * 1000
-    baseline_start = current_ms - BASELINE_WINDOW_MINUTES * 60 * 1000
-
-    recent = [x for x in records if x["ts_ms"] >= recent_start]
-    baseline = [x for x in records if baseline_start <= x["ts_ms"] < recent_start]
-
-    recent_count = len(recent)
-    recent_notional = sum(x["notional"] for x in recent)
-
-    baseline_count = len(baseline)
-    baseline_notional = sum(x["notional"] for x in baseline)
-
-    bucket_count = max(BASELINE_WINDOW_MINUTES / RECENT_WINDOW_MINUTES, 1)
-
-    baseline_avg_count = baseline_count / bucket_count if baseline_count > 0 else 0.0
-    baseline_avg_notional = baseline_notional / bucket_count if baseline_notional > 0 else 0.0
-
-    activity_count_ratio = (recent_count / baseline_avg_count) if baseline_avg_count > 0 else None
-    activity_notional_ratio = (recent_notional / baseline_avg_notional) if baseline_avg_notional > 0 else None
-
-    buy_notional = sum(x["notional"] for x in recent if x["side"] == "buy")
-    sell_notional = sum(x["notional"] for x in recent if x["side"] == "sell")
-
-    buy_large_notional = sum(
-        x["notional"] for x in recent
-        if x["side"] == "buy" and x["notional"] >= LARGE_TRADE_USDT
-    )
-    sell_large_notional = sum(
-        x["notional"] for x in recent
-        if x["side"] == "sell" and x["notional"] >= LARGE_TRADE_USDT
-    )
-
-    buy_large_count = sum(
-        1 for x in recent
-        if x["side"] == "buy" and x["notional"] >= LARGE_TRADE_USDT
-    )
-    sell_large_count = sum(
-        1 for x in recent
-        if x["side"] == "sell" and x["notional"] >= LARGE_TRADE_USDT
-    )
-
-    if sell_notional > 0:
-        buy_sell_imbalance = buy_notional / sell_notional
-    else:
-        buy_sell_imbalance = 999.0 if buy_notional > 0 else None
-
-    if sell_large_notional > 0:
-        large_order_imbalance = buy_large_notional / sell_large_notional
-    else:
-        large_order_imbalance = 999.0 if buy_large_notional > 0 else None
-
-    return {
-        "recent_count": recent_count,
-        "recent_notional": recent_notional,
-        "activity_count_ratio": activity_count_ratio,
-        "activity_notional_ratio": activity_notional_ratio,
-        "buy_notional": buy_notional,
-        "sell_notional": sell_notional,
-        "buy_large_notional": buy_large_notional,
-        "sell_large_notional": sell_large_notional,
-        "buy_large_count": buy_large_count,
-        "sell_large_count": sell_large_count,
-        "buy_sell_imbalance": buy_sell_imbalance,
-        "large_order_imbalance": large_order_imbalance,
-    }
-
-def calc_orderbook_imbalance(ob: Optional[Dict[str, Any]]) -> Optional[float]:
-    if not ob:
-        return None
-
-    bids = ob.get("bids", [])[:5]
-    asks = ob.get("asks", [])[:5]
-
-    bid_depth = 0.0
-    ask_depth = 0.0
-
-    for p, s in bids:
-        bid_depth += float(p) * float(s)
-
-    for p, s in asks:
-        ask_depth += float(p) * float(s)
-
-    if ask_depth <= 0:
-        return 999.0 if bid_depth > 0 else None
-
-    return bid_depth / ask_depth
-
-def build_flow_signal(item: Dict[str, Any], flow: Dict[str, Any], ob_imbalance: Optional[float]) -> Optional[Dict[str, Any]]:
-    recent_notional = flow.get("recent_notional") or 0.0
-    activity_notional_ratio = flow.get("activity_notional_ratio")
-    buy_sell_imbalance = flow.get("buy_sell_imbalance")
-    large_order_imbalance = flow.get("large_order_imbalance")
-
-    if recent_notional < MIN_RECENT_NOTIONAL_USDT:
-        return None
-
-    long_score = 0
-    short_score = 0
-    long_reasons: List[str] = []
-    short_reasons: List[str] = []
-
-    if activity_notional_ratio is not None and activity_notional_ratio >= ACTIVITY_RATIO_THRESHOLD:
-        long_score += 1
-        short_score += 1
-        long_reasons.append(f"短时成交额放大 {activity_notional_ratio:.2f} 倍")
-        short_reasons.append(f"短时成交额放大 {activity_notional_ratio:.2f} 倍")
-
-    if buy_sell_imbalance is not None:
-        if buy_sell_imbalance >= BUY_SELL_IMBALANCE_THRESHOLD:
-            long_score += 2
-            long_reasons.append(f"主动买盘强于卖盘 {buy_sell_imbalance:.2f} 倍")
-        elif buy_sell_imbalance > 0 and buy_sell_imbalance <= 1 / BUY_SELL_IMBALANCE_THRESHOLD:
-            short_score += 2
-            short_reasons.append(f"主动卖盘强于买盘 {(1 / buy_sell_imbalance):.2f} 倍")
-
-    if large_order_imbalance is not None:
-        if large_order_imbalance >= LARGE_ORDER_IMBALANCE_THRESHOLD:
-            long_score += 2
-            long_reasons.append(f"买入大单强于卖出大单 {large_order_imbalance:.2f} 倍")
-        elif large_order_imbalance > 0 and large_order_imbalance <= 1 / LARGE_ORDER_IMBALANCE_THRESHOLD:
-            short_score += 2
-            short_reasons.append(f"卖出大单强于买入大单 {(1 / large_order_imbalance):.2f} 倍")
-
-    if ob_imbalance is not None:
-        if ob_imbalance >= ORDERBOOK_IMBALANCE_THRESHOLD:
-            long_score += 1
-            long_reasons.append(f"盘口买盘深度强于卖盘 {ob_imbalance:.2f} 倍")
-        elif ob_imbalance > 0 and ob_imbalance <= 1 / ORDERBOOK_IMBALANCE_THRESHOLD:
-            short_score += 1
-            short_reasons.append(f"盘口卖盘深度强于买盘 {(1 / ob_imbalance):.2f} 倍")
-
-    if long_score >= 4 and long_score > short_score:
-        return {
-            "signal_type": "LONG",
-            "signal_text": "买多信号",
-            "score": long_score,
-            "reasons": long_reasons,
-        }
-
-    if short_score >= 4 and short_score > long_score:
-        return {
-            "signal_type": "SHORT",
-            "signal_text": "买空信号",
-            "score": short_score,
-            "reasons": short_reasons,
-        }
-
-    return None
-
-# =========================================================
-# Telegram
-# =========================================================
-
-async def send_telegram_message(text: str) -> bool:
-    if not TELEGRAM_ENABLED:
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+async def tg_send(session: aiohttp.ClientSession, text: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print(text)
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": TG_CHAT_ID,
         "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
     }
-
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return bool(data.get("ok"))
+        async with session.post(url, json=payload) as r:
+            if r.status != 200:
+                print("telegram fail:", r.status, await r.text())
     except Exception as e:
-        logger.warning("telegram 推送失败: %s", e)
-        return False
+        print("telegram exception:", e)
 
-def should_send_alert(exchange: str, symbol: str, signal_type: str) -> bool:
-    key = f"{exchange}|{symbol}|{signal_type}"
-    last_ts = last_alert_sent_at.get(key)
-    now_ts = time.time()
-    if last_ts is None:
-        return True
-    return (now_ts - last_ts) >= ALERT_COOLDOWN_SECONDS
 
-def mark_alert_sent(exchange: str, symbol: str, signal_type: str) -> None:
-    key = f"{exchange}|{symbol}|{signal_type}"
-    last_alert_sent_at[key] = time.time()
+# ============================================
+# REST：选相似币
+# ============================================
 
-def format_signal_message(item: Dict[str, Any], flow: Dict[str, Any], signal: Dict[str, Any], ob_imbalance: Optional[float]) -> str:
-    lines = [
-        f"",
-        f"时间（北京时间）：{beijing_now_str()}",
-        f"交易所：{item['exchange']}",
-        f"市场：合约",
-        f"币种：{item['symbol']}",
-        f"交易对：{item['raw_symbol']}",
-        f"最新价格：{format_number(item.get('last_price'), 6)}",
-        f"最近{RECENT_WINDOW_MINUTES}分钟成交额：{format_volume(flow.get('recent_notional'))} USDT",
-        f"最近{RECENT_WINDOW_MINUTES}分钟成交笔数：{flow.get('recent_count', 0)}",
-        f"活跃度放大倍数：{format_number(flow.get('activity_notional_ratio'), 2)}",
-        f"主动买卖比：{format_number(flow.get('buy_sell_imbalance'), 2)}",
-        f"大单买卖比：{format_number(flow.get('large_order_imbalance'), 2)}",
-        f"买入大单次数：{flow.get('buy_large_count', 0)}",
-        f"卖出大单次数：{flow.get('sell_large_count', 0)}",
-        f"盘口失衡比：{format_number(ob_imbalance, 2)}",
-        f"信号强度：{signal.get('score')}",
-        "触发原因：",
-    ]
-    for r in signal.get("reasons", []):
-        lines.append(f"- {r}")
-    return "\n".join(lines)
+async def gate_pick_similar(session: aiohttp.ClientSession) -> List[str]:
+    url = f"{GATE_REST}/spot/tickers"
+    async with session.get(url) as r:
+        data = await r.json()
 
-# =========================================================
-# 状态写入与评估
-# =========================================================
-
-async def on_trade(exchange: str, raw_symbol: str, price: float, size: float, side: str, ts_ms: int) -> None:
-    key = market_key(exchange, raw_symbol)
-
-    records = trade_cache[key]
-    rec = make_trade_record(
-        exchange=exchange,
-        raw_symbol=raw_symbol,
-        price=price,
-        size=size,
-        side=side,
-        ts_ms=ts_ms,
-    )
-
-    signature = (rec["ts_ms"], rec["price"], rec["size"], rec["side"])
-    recent_sigs = set((x["ts_ms"], x["price"], x["size"], x["side"]) for x in list(records)[-300:])
-    if signature not in recent_sigs:
-        records.append(rec)
-
-    prune_trade_cache(records, now_ms())
-
-    item = market_state.get(key)
-    if item is None:
-        market_state[key] = make_market_item(
-            exchange=exchange,
-            raw_symbol=raw_symbol,
-            last_price=price,
-        )
-    else:
-        item["last_price"] = price
-        item["updated_at"] = utc_now_iso()
-
-    await evaluate_and_alert(exchange, raw_symbol)
-
-async def on_orderbook(exchange: str, raw_symbol: str, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], ts_ms: int) -> None:
-    key = market_key(exchange, raw_symbol)
-    orderbook_state[key] = {
-        "bids": bids[:10],
-        "asks": asks[:10],
-        "ts_ms": ts_ms,
-    }
-    await evaluate_and_alert(exchange, raw_symbol)
-
-async def on_ticker(exchange: str, raw_symbol: str, last_price: Optional[float], volume_24h: Optional[float], open_interest: Optional[float], funding_rate: Optional[float]) -> None:
-    key = market_key(exchange, raw_symbol)
-    item = market_state.get(key)
-    if item is None:
-        market_state[key] = make_market_item(
-            exchange=exchange,
-            raw_symbol=raw_symbol,
-            last_price=last_price,
-            volume_24h=volume_24h,
-            open_interest=open_interest,
-            funding_rate=funding_rate,
-        )
-    else:
-        if last_price is not None:
-            item["last_price"] = last_price
-        if volume_24h is not None:
-            item["volume_24h"] = volume_24h
-        if open_interest is not None:
-            item["open_interest"] = open_interest
-        if funding_rate is not None:
-            item["funding_rate"] = funding_rate
-        item["updated_at"] = utc_now_iso()
-
-async def evaluate_and_alert(exchange: str, raw_symbol: str) -> None:
-    key = market_key(exchange, raw_symbol)
-    item = market_state.get(key)
-    if not item:
-        return
-
-    records = list(trade_cache.get(key, []))
-    if not records:
-        return
-
-    flow = calc_trade_flow_stats(records, now_ms())
-    ob_imbalance = calc_orderbook_imbalance(orderbook_state.get(key))
-    signal = build_flow_signal(item, flow, ob_imbalance)
-    if not signal:
-        return
-
-    if should_send_alert(exchange, item["symbol"], signal["signal_type"]):
-        text = format_signal_message(item, flow, signal, ob_imbalance)
-        ok = await send_telegram_message(text)
-        if ok:
-            mark_alert_sent(exchange, item["symbol"], signal["signal_type"])
-            logger.info("已推送信号 exchange=%s symbol=%s type=%s", exchange, item["symbol"], signal["signal_type"])
-        else:
-            logger.info("命中信号但未推送 exchange=%s symbol=%s type=%s telegram_enabled=%s",
-                        exchange, item["symbol"], signal["signal_type"], TELEGRAM_ENABLED)
-
-# =========================================================
-# Gate WebSocket
-# Gate futures WS 文档提供 usdt 连接地址与期货频道。:contentReference[oaicite:2]{index=2}
-# =========================================================
-
-async def gate_ping_loop(ws) -> None:
-    while True:
-        await asyncio.sleep(20)
-        try:
-            await ws.send(json.dumps({
-                "time": int(time.time()),
-                "channel": "futures.ping"
-            }))
-        except Exception:
-            return
-
-async def gate_ws_loop() -> None:
-    url = "wss://fx-ws.gateio.ws/v4/ws/usdt"
-
-    while True:
-        try:
-            logger.info("连接 Gate WS...")
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=None,
-            ) as ws:
-                # ticker
-                await ws.send(json.dumps({
-                    "time": int(time.time()),
-                    "channel": "futures.tickers",
-                    "event": "subscribe",
-                    "payload": GATE_SYMBOLS,
-                }))
-
-                # trades
-                await ws.send(json.dumps({
-                    "time": int(time.time()),
-                    "channel": "futures.trades",
-                    "event": "subscribe",
-                    "payload": GATE_SYMBOLS,
-                }))
-
-                # order book
-                for sym in GATE_SYMBOLS:
-                    await ws.send(json.dumps({
-                        "time": int(time.time()),
-                        "channel": "futures.order_book",
-                        "event": "subscribe",
-                        "payload": [sym, "20", "0"],
-                    }))
-
-                ping_task = asyncio.create_task(gate_ping_loop(ws))
-
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    channel = msg.get("channel")
-                    event = msg.get("event")
-
-                    if channel == "futures.tickers" and event == "update":
-                        result = msg.get("result", [])
-                        if isinstance(result, dict):
-                            result = [result]
-                        for row in result:
-                            raw_symbol = str(row.get("contract", "")).upper()
-                            if raw_symbol not in GATE_SYMBOLS:
-                                continue
-                            await on_ticker(
-                                exchange="gate",
-                                raw_symbol=raw_symbol,
-                                last_price=safe_float(row.get("last")),
-                                volume_24h=safe_float(row.get("volume_24h_quote")),
-                                open_interest=safe_float(row.get("total_size")),
-                                funding_rate=safe_float(row.get("funding_rate")),
-                            )
-
-                    elif channel == "futures.trades" and event == "update":
-                        result = msg.get("result", [])
-                        if isinstance(result, dict):
-                            result = [result]
-                        for row in result:
-                            raw_symbol = str(row.get("contract", "")).upper()
-                            if raw_symbol not in GATE_SYMBOLS:
-                                continue
-
-                            price = safe_float(row.get("price"))
-                            size_raw = safe_float(row.get("size"))
-                            ts_ms = int(safe_float(row.get("create_time_ms"), now_ms()))
-
-                            if price is None or size_raw is None:
-                                continue
-
-                            # Gate futures 的 size 近期有字段类型升级公告，这里统一转 float 且用绝对值。:contentReference[oaicite:3]{index=3}
-                            side = "buy" if size_raw > 0 else "sell"
-                            size = abs(float(size_raw))
-
-                            await on_trade(
-                                exchange="gate",
-                                raw_symbol=raw_symbol,
-                                price=price,
-                                size=size,
-                                side=side,
-                                ts_ms=ts_ms,
-                            )
-
-                    elif channel == "futures.order_book" and event in ("all", "update"):
-                        result = msg.get("result", {})
-                        raw_symbol = str(result.get("contract", "")).upper()
-                        if raw_symbol not in GATE_SYMBOLS:
-                            continue
-
-                        bids: List[Tuple[float, float]] = []
-                        asks: List[Tuple[float, float]] = []
-
-                        for row in result.get("bids", [])[:10]:
-                            if isinstance(row, dict):
-                                p = safe_float(row.get("p"))
-                                s = safe_float(row.get("s"))
-                            elif isinstance(row, list) and len(row) >= 2:
-                                p = safe_float(row[0])
-                                s = safe_float(row[1])
-                            else:
-                                continue
-                            if p is not None and s is not None:
-                                bids.append((p, abs(float(s))))
-
-                        for row in result.get("asks", [])[:10]:
-                            if isinstance(row, dict):
-                                p = safe_float(row.get("p"))
-                                s = safe_float(row.get("s"))
-                            elif isinstance(row, list) and len(row) >= 2:
-                                p = safe_float(row[0])
-                                s = safe_float(row[1])
-                            else:
-                                continue
-                            if p is not None and s is not None:
-                                asks.append((p, abs(float(s))))
-
-                        await on_orderbook(
-                            exchange="gate",
-                            raw_symbol=raw_symbol,
-                            bids=bids,
-                            asks=asks,
-                            ts_ms=int(safe_float(result.get("t"), now_ms())),
-                        )
-
-                ping_task.cancel()
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("Gate WS 断开，5 秒后重连: %s", e)
-            await asyncio.sleep(5)
-
-# =========================================================
-# MEXC WebSocket
-# MEXC futures WS 文档提供 edge 地址，且要求客户端周期性发送 ping。:contentReference[oaicite:4]{index=4}
-# =========================================================
-
-async def mexc_ping_loop(ws) -> None:
-    while True:
-        await asyncio.sleep(15)
-        try:
-            await ws.send(json.dumps({"method": "ping"}))
-        except Exception:
-            return
-
-async def mexc_ws_loop() -> None:
-    url = "wss://contract.mexc.com/edge"
-
-    while True:
-        try:
-            logger.info("连接 MEXC WS...")
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=None,
-            ) as ws:
-                for sym in MEXC_SYMBOLS:
-                    await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": sym}}))
-                    await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": sym}}))
-                    await ws.send(json.dumps({"method": "sub.ticker", "param": {"symbol": sym}}))
-
-                ping_task = asyncio.create_task(mexc_ping_loop(ws))
-
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    channel = msg.get("channel")
-                    raw_symbol = str(msg.get("symbol", "")).upper()
-
-                    if channel == "push.ticker":
-                        data = msg.get("data", {})
-                        if raw_symbol in MEXC_SYMBOLS:
-                            await on_ticker(
-                                exchange="mexc",
-                                raw_symbol=raw_symbol,
-                                last_price=safe_float(data.get("lastPrice")),
-                                volume_24h=safe_float(data.get("amount24")),
-                                open_interest=safe_float(data.get("holdVol")),
-                                funding_rate=safe_float(data.get("fundingRate")),
-                            )
-
-                    elif channel == "push.deal":
-                        if raw_symbol not in MEXC_SYMBOLS:
-                            continue
-
-                        rows = msg.get("data", [])
-                        if isinstance(rows, dict):
-                            rows = [rows]
-
-                        for row in rows:
-                            price = safe_float(row.get("p"))
-                            size = safe_float(row.get("v"))
-                            ts_ms = int(safe_float(row.get("t"), now_ms()))
-                            side_code = row.get("T")
-
-                            if price is None or size is None:
-                                continue
-
-                            try:
-                                side = "buy" if int(side_code) == 1 else "sell"
-                            except Exception:
-                                side = "unknown"
-
-                            await on_trade(
-                                exchange="mexc",
-                                raw_symbol=raw_symbol,
-                                price=price,
-                                size=abs(float(size)),
-                                side=side,
-                                ts_ms=ts_ms,
-                            )
-
-                    elif channel == "push.depth":
-                        if raw_symbol not in MEXC_SYMBOLS:
-                            continue
-
-                        data = msg.get("data", {})
-                        bids: List[Tuple[float, float]] = []
-                        asks: List[Tuple[float, float]] = []
-
-                        for row in data.get("bids", [])[:10]:
-                            if isinstance(row, list) and len(row) >= 2:
-                                p = safe_float(row[0])
-                                s = safe_float(row[1])
-                            elif isinstance(row, dict):
-                                p = safe_float(row.get("price"))
-                                s = safe_float(row.get("vol"))
-                            else:
-                                continue
-                            if p is not None and s is not None:
-                                bids.append((p, abs(float(s))))
-
-                        for row in data.get("asks", [])[:10]:
-                            if isinstance(row, list) and len(row) >= 2:
-                                p = safe_float(row[0])
-                                s = safe_float(row[1])
-                            elif isinstance(row, dict):
-                                p = safe_float(row.get("price"))
-                                s = safe_float(row.get("vol"))
-                            else:
-                                continue
-                            if p is not None and s is not None:
-                                asks.append((p, abs(float(s))))
-
-                        await on_orderbook(
-                            exchange="mexc",
-                            raw_symbol=raw_symbol,
-                            bids=bids,
-                            asks=asks,
-                            ts_ms=int(safe_float(msg.get("ts"), now_ms())),
-                        )
-
-                ping_task.cancel()
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("MEXC WS 断开，5 秒后重连: %s", e)
-            await asyncio.sleep(5)
-
-# =========================================================
-# FastAPI lifespan
-# =========================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info(
-        "启动配置 port=%s auto_scan_enabled=%s telegram_enabled=%s watchlist_count=%s",
-        PORT,
-        AUTO_SCAN_ENABLED,
-        TELEGRAM_ENABLED,
-        len(RAW_WATCHLIST),
-    )
-
-    if AUTO_SCAN_ENABLED:
-        if ENABLE_GATE:
-            _bg_tasks.append(asyncio.create_task(gate_ws_loop()))
-        if ENABLE_MEXC:
-            _bg_tasks.append(asyncio.create_task(mexc_ws_loop()))
-        logger.info("已创建 WebSocket 后台任务 count=%s", len(_bg_tasks))
-
-    try:
-        yield
-    finally:
-        for task in _bg_tasks:
-            task.cancel()
-
-        for task in _bg_tasks:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-app = FastAPI(
-    title="Flow Signal Scanner WS",
-    version="5.0.0",
-    lifespan=lifespan,
-)
-
-# =========================================================
-# API
-# =========================================================
-
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "time_beijing": beijing_now_str(),
-        "auto_scan_enabled": AUTO_SCAN_ENABLED,
-        "telegram_enabled": TELEGRAM_ENABLED,
-        "watchlist_count": len(RAW_WATCHLIST),
-        "enabled_exchanges": {
-            "gate_futures": ENABLE_GATE,
-            "mexc_futures": ENABLE_MEXC,
-        },
-        "state": {
-            "market_state": len(market_state),
-            "orderbook_state": len(orderbook_state),
-            "trade_cache_keys": len(trade_cache),
-        },
-        "config": {
-            "large_trade_usdt": LARGE_TRADE_USDT,
-            "recent_window_minutes": RECENT_WINDOW_MINUTES,
-            "baseline_window_minutes": BASELINE_WINDOW_MINUTES,
-            "min_recent_notional_usdt": MIN_RECENT_NOTIONAL_USDT,
-            "activity_ratio_threshold": ACTIVITY_RATIO_THRESHOLD,
-            "buy_sell_imbalance_threshold": BUY_SELL_IMBALANCE_THRESHOLD,
-            "large_order_imbalance_threshold": LARGE_ORDER_IMBALANCE_THRESHOLD,
-            "orderbook_imbalance_threshold": ORDERBOOK_IMBALANCE_THRESHOLD,
-            "alert_cooldown_seconds": ALERT_COOLDOWN_SECONDS,
-        }
-    }
-
-@app.get("/watchlist")
-async def watchlist() -> Dict[str, Any]:
-    return {
-        "count": len(RAW_WATCHLIST),
-        "raw_watchlist": RAW_WATCHLIST,
-        "gate_symbols": GATE_SYMBOLS,
-        "mexc_symbols": MEXC_SYMBOLS,
-    }
-
-@app.get("/state")
-async def state() -> Dict[str, Any]:
-    sample_markets = dict(list(market_state.items())[:20])
-    sample_orderbooks = dict(list(orderbook_state.items())[:20])
-
-    return {
-        "generated_at": utc_now_iso(),
-        "generated_at_beijing": beijing_now_str(),
-        "market_state_count": len(market_state),
-        "orderbook_state_count": len(orderbook_state),
-        "trade_cache_count": len(trade_cache),
-        "sample_markets": sample_markets,
-        "sample_orderbooks": sample_orderbooks,
-    }
-
-@app.get("/signals")
-async def signals_preview() -> Dict[str, Any]:
-    out = []
-    current_ms = now_ms()
-
-    for key, item in market_state.items():
-        records = list(trade_cache.get(key, []))
-        if not records:
+    picks = []
+    for t in data:
+        sym = t.get("currency_pair", "")
+        if not sym.endswith("_USDT"):
             continue
 
-        flow = calc_trade_flow_stats(records, current_ms)
-        ob_imbalance = calc_orderbook_imbalance(orderbook_state.get(key))
-        signal = build_flow_signal(item, flow, ob_imbalance)
+        last = safe_float(t.get("last"))
+        qv = safe_float(t.get("quote_volume"))
+        chg = abs(safe_float(t.get("change_percentage")) / 100.0)
 
-        if signal:
-            out.append({
-                "exchange": item["exchange"],
-                "symbol": item["symbol"],
-                "raw_symbol": item["raw_symbol"],
-                "signal_type": signal["signal_type"],
-                "score": signal["score"],
-                "recent_notional": flow.get("recent_notional"),
-                "activity_notional_ratio": flow.get("activity_notional_ratio"),
-                "buy_sell_imbalance": flow.get("buy_sell_imbalance"),
-                "large_order_imbalance": flow.get("large_order_imbalance"),
-                "orderbook_imbalance": ob_imbalance,
-                "reasons": signal.get("reasons", []),
-            })
+        if last <= 0 or last > 5:
+            continue
+        if qv < 100_000 or qv > 80_000_000:
+            continue
+        if chg < 0.015:
+            continue
 
-    return {
-        "generated_at_beijing": beijing_now_str(),
-        "signal_count": len(out),
-        "signals": out,
-    }
+        score = 0.0
+        if last < 1:
+            score += 3
+        if last < 0.2:
+            score += 3
+        if 300_000 <= qv <= 8_000_000:
+            score += 1.5
+        score += clamp(chg * 20, 0, 4)
 
-# =========================================================
-# 本地启动
-# =========================================================
+        picks.append((score, sym))
+
+    picks.sort(reverse=True)
+    result = [s for _, s in picks[:SIMILAR_COUNT]]
+    if SEED_GATE in result:
+        result.remove(SEED_GATE)
+    return [SEED_GATE] + result[:SIMILAR_COUNT]
+
+
+async def mexc_pick_similar(session: aiohttp.ClientSession) -> List[str]:
+    url = f"{MEXC_REST}/api/v3/ticker/24hr"
+    async with session.get(url) as r:
+        data = await r.json()
+
+    picks = []
+    for t in data:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+
+        last = safe_float(t.get("lastPrice"))
+        qv = safe_float(t.get("quoteVolume"))
+        chg = abs(safe_float(t.get("priceChangePercent")))
+
+        if last <= 0 or last > 5:
+            continue
+        if qv < 100_000 or qv > 80_000_000:
+            continue
+        if chg < 0.015:
+            continue
+
+        score = 0.0
+        if last < 1:
+            score += 3
+        if last < 0.2:
+            score += 3
+        if 300_000 <= qv <= 8_000_000:
+            score += 1.5
+        score += clamp(chg * 20, 0, 4)
+
+        picks.append((score, sym))
+
+    picks.sort(reverse=True)
+    result = [s for _, s in picks[:SIMILAR_COUNT]]
+    if SEED_MEXC in result:
+        result.remove(SEED_MEXC)
+    return [SEED_MEXC] + result[:SIMILAR_COUNT]
+
+
+# ============================================
+# 核心信号引擎
+# ============================================
+
+class FilteredSignalEngine:
+    def __init__(self):
+        self.states: Dict[str, SymbolState] = {}
+
+    def ensure(self, exchange: str, symbol: str) -> SymbolState:
+        key = f"{exchange}:{symbol}"
+        if key not in self.states:
+            self.states[key] = SymbolState(exchange=exchange, symbol=symbol)
+        return self.states[key]
+
+    def on_trade(self, exchange: str, symbol: str, price: float, amount: float, side: str, ts: float):
+        st = self.ensure(exchange, symbol)
+        st.trades.append(TradeTick(ts=ts, price=price, amount=amount, side=side))
+        st.prices.append((ts, price))
+        # 方向打点
+        dir_mark = 1 if side == "buy" else -1
+        st.direction_marks.append((ts, dir_mark))
+
+    def on_book(self, exchange: str, symbol: str, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], ts: float):
+        st = self.ensure(exchange, symbol)
+        st.book = BookState(
+            bids=bids[:TOP_N_ORDERBOOK],
+            asks=asks[:TOP_N_ORDERBOOK],
+            ts=ts
+        )
+
+    # -------------------------
+    # 窗口数据
+    # -------------------------
+
+    def _recent_trades(self, st: SymbolState, sec: int) -> List[TradeTick]:
+        cutoff = now() - sec
+        return [x for x in st.trades if x.ts >= cutoff]
+
+    def _recent_prices(self, st: SymbolState, sec: int) -> List[Tuple[float, float]]:
+        cutoff = now() - sec
+        return [x for x in st.prices if x[0] >= cutoff]
+
+    def _recent_dirs(self, st: SymbolState, sec: int) -> List[int]:
+        cutoff = now() - sec
+        return [d for ts, d in st.direction_marks if ts >= cutoff]
+
+    # -------------------------
+    # 基础特征
+    # -------------------------
+
+    def _book_imbalance(self, st: SymbolState) -> float:
+        bids = sum(p * q for p, q in st.book.bids)
+        asks = sum(p * q for p, q in st.book.asks)
+        total = bids + asks
+        if total <= 0:
+            return 0.0
+        return (bids - asks) / total
+
+    def _trade_delta(self, trades: List[TradeTick]) -> float:
+        buy_amt = sum(t.price * t.amount for t in trades if t.side == "buy")
+        sell_amt = sum(t.price * t.amount for t in trades if t.side == "sell")
+        total = buy_amt + sell_amt
+        if total <= 0:
+            return 0.0
+        return (buy_amt - sell_amt) / total
+
+    def _notional(self, trades: List[TradeTick]) -> float:
+        return sum(t.price * t.amount for t in trades)
+
+    def _momentum(self, st: SymbolState, sec: int) -> float:
+        ps = self._recent_prices(st, sec)
+        if len(ps) < 2:
+            return 0.0
+        return pct(ps[0][1], ps[-1][1])
+
+    def _breakout(self, st: SymbolState, sec: int = 120) -> float:
+        ps = self._recent_prices(st, sec)
+        if len(ps) < 6:
+            return 0.0
+        prev_high = max(p for _, p in ps[:-1])
+        last = ps[-1][1]
+        return pct(prev_high, last) if last > prev_high else 0.0
+
+    def _breakdown(self, st: SymbolState, sec: int = 120) -> float:
+        ps = self._recent_prices(st, sec)
+        if len(ps) < 6:
+            return 0.0
+        prev_low = min(p for _, p in ps[:-1])
+        last = ps[-1][1]
+        return pct(last, prev_low) if last < prev_low else 0.0
+
+    def _vol_surge(self, st: SymbolState) -> float:
+        # 10秒成交额 vs 前60秒平均每10秒成交额
+        w10 = self._recent_trades(st, 10)
+        w60 = self._recent_trades(st, 60)
+        v10 = self._notional(w10)
+        v60 = self._notional(w60)
+        base = v60 / 6 if v60 > 0 else 0
+        if base <= 0:
+            return 0.0
+        return v10 / base
+
+    def _retrace_ratio(self, prices: List[Tuple[float, float]]) -> float:
+        if len(prices) < 3:
+            return 0.0
+        vals = [p for _, p in prices]
+        start = vals[0]
+        end = vals[-1]
+        hi = max(vals)
+        lo = min(vals)
+
+        # 上涨后的回吐
+        if end >= start:
+            impulse = hi - start
+            if impulse <= 0:
+                return 0.0
+            pullback = hi - end
+            return pullback / impulse
+
+        # 下跌后的拉回
+        impulse = start - lo
+        if impulse <= 0:
+            return 0.0
+        pullback = end - lo
+        return pullback / impulse
+
+    def _direction_stability(self, st: SymbolState, sec: int = 12) -> float:
+        dirs = self._recent_dirs(st, sec)
+        if not dirs:
+            return 0.0
+        s = sum(dirs)
+        return s / len(dirs)  # [-1, 1]
+
+    # -------------------------
+    # 噪音过滤
+    # -------------------------
+
+    def _noise_filter(self, st: SymbolState, ob_imb: float, breakout: float, breakdown: float) -> Tuple[bool, str]:
+        trades_10 = self._recent_trades(st, 10)
+        trades_30 = self._recent_trades(st, 30)
+        prices_10 = self._recent_prices(st, 10)
+        prices_30 = self._recent_prices(st, 30)
+
+        td10 = self._trade_delta(trades_10)
+        td30 = self._trade_delta(trades_30)
+        pm10 = self._momentum(st, 10)
+        pm30 = self._momentum(st, 30)
+        retrace10 = self._retrace_ratio(prices_10)
+        notional_10 = self._notional(trades_10)
+        dir_stab = self._direction_stability(st, 12)
+
+        # 1) 双向过于均衡：像套利/对冲
+        if abs(td10) < 0.12 and abs(td30) < 0.10:
+            return False, "双向成交过于均衡"
+
+        # 2) 有量无价：有成交没位移
+        if notional_10 > 0 and abs(pm10) < 0.002 and abs(td10) < 0.18:
+            return False, "有量无价"
+
+        # 3) 盘口和主动成交冲突
+        if sign(ob_imb) != 0 and sign(td10) != 0 and sign(ob_imb) != sign(td10):
+            return False, "盘口与成交方向冲突"
+
+        # 4) 回吐/拉回过深
+        if retrace10 > 0.55:
+            return False, "回吐过深"
+
+        # 5) 买盘在推但没有突破
+        if td10 > 0 and pm10 > 0 and breakout <= 0:
+            return False, "买盘未形成有效突破"
+
+        # 6) 卖盘在砸但没有跌破
+        if td10 < 0 and pm10 < 0 and breakdown <= 0:
+            return False, "卖盘未形成有效跌破"
+
+        # 7) 方向不稳定：多空翻来翻去
+        if abs(dir_stab) < 0.15:
+            return False, "方向稳定度不足"
+
+        # 8) 10秒方向与30秒方向冲突
+        if sign(td10) != 0 and sign(td30) != 0 and sign(td10) != sign(td30):
+            return False, "短长窗口方向冲突"
+
+        # 9) 30秒也没实质位移
+        if abs(pm30) < 0.003:
+            return False, "30秒位移不足"
+
+        return True, "OK"
+
+    # -------------------------
+    # 初筛评分
+    # -------------------------
+
+    def _pre_score(self, st: SymbolState) -> Optional[Tuple[str, float, List[str]]]:
+        if len(st.trades) < 30 or len(st.prices) < 30 or not st.book.bids or not st.book.asks:
+            return None
+
+        vol_surge = self._vol_surge(st)
+        mom10 = self._momentum(st, 10)
+        mom30 = self._momentum(st, 30)
+        breakout = self._breakout(st, 120)
+        breakdown = self._breakdown(st, 120)
+        ob = self._book_imbalance(st)
+        td10 = self._trade_delta(self._recent_trades(st, 10))
+        td30 = self._trade_delta(self._recent_trades(st, 30))
+        dir_stab = self._direction_stability(st, 12)
+
+        ok, reason = self._noise_filter(st, ob, breakout, breakdown)
+        if not ok:
+            return None
+
+        long_score = 0.0
+        long_reasons = []
+
+        if vol_surge > 2.2:
+            long_score += 18
+            long_reasons.append(f"放量 {vol_surge:.2f}x")
+        if td10 > 0.22:
+            long_score += 18
+            long_reasons.append(f"10s主动买入 {td10:.2f}")
+        if td30 > 0.16:
+            long_score += 14
+            long_reasons.append(f"30s主动买入 {td30:.2f}")
+        if mom10 > 0.003:
+            long_score += 10
+            long_reasons.append(f"10s位移 {mom10*100:.2f}%")
+        if mom30 > 0.006:
+            long_score += 10
+            long_reasons.append(f"30s位移 {mom30*100:.2f}%")
+        if ob > 0.12:
+            long_score += 12
+            long_reasons.append(f"买盘失衡 {ob:.2f}")
+        if breakout > 0.0015:
+            long_score += 14
+            long_reasons.append(f"有效突破 {breakout*100:.2f}%")
+        if dir_stab > 0.22:
+            long_score += 8
+            long_reasons.append(f"方向稳定 {dir_stab:.2f}")
+
+        short_score = 0.0
+        short_reasons = []
+
+        if vol_surge > 2.2:
+            short_score += 18
+            short_reasons.append(f"放量 {vol_surge:.2f}x")
+        if td10 < -0.22:
+            short_score += 18
+            short_reasons.append(f"10s主动卖出 {td10:.2f}")
+        if td30 < -0.16:
+            short_score += 14
+            short_reasons.append(f"30s主动卖出 {td30:.2f}")
+        if mom10 < -0.003:
+            short_score += 10
+            short_reasons.append(f"10s位移 {mom10*100:.2f}%")
+        if mom30 < -0.006:
+            short_score += 10
+            short_reasons.append(f"30s位移 {mom30*100:.2f}%")
+        if ob < -0.12:
+            short_score += 12
+            short_reasons.append(f"卖盘失衡 {ob:.2f}")
+        if breakdown > 0.0015:
+            short_score += 14
+            short_reasons.append(f"有效跌破 {breakdown*100:.2f}%")
+        if dir_stab < -0.22:
+            short_score += 8
+            short_reasons.append(f"方向稳定 {dir_stab:.2f}")
+
+        if long_score >= 60 and long_score > short_score + 10:
+            return "LONG", long_score, long_reasons[:6]
+        if short_score >= 60 and short_score > long_score + 10:
+            return "SHORT", short_score, short_reasons[:6]
+
+        return None
+
+    # -------------------------
+    # 二段确认
+    # -------------------------
+
+    def _confirm_candidate(self, st: SymbolState) -> Optional[Tuple[str, float, List[str], float]]:
+        cand = st.candidate
+        if not cand:
+            return None
+
+        age = now() - cand.created_ts
+        if age > CANDIDATE_EXPIRE_SEC:
+            st.candidate = None
+            return None
+
+        if len(st.prices) < 10 or len(st.trades) < 10:
+            return None
+
+        last_price = st.prices[-1][1]
+        prices_8 = self._recent_prices(st, 8)
+        trades_8 = self._recent_trades(st, 8)
+        trades_15 = self._recent_trades(st, 15)
+
+        if len(prices_8) < 3 or len(trades_8) < 5:
+            return None
+
+        move_8 = self._momentum(st, 8)
+        td8 = self._trade_delta(trades_8)
+        td15 = self._trade_delta(trades_15)
+        ob = self._book_imbalance(st)
+        retrace_8 = self._retrace_ratio(prices_8)
+        dir_stab = self._direction_stability(st, 8)
+        breakout = self._breakout(st, 120)
+        breakdown = self._breakdown(st, 120)
+
+        score = cand.initial_score
+        reasons = list(cand.reasons)
+
+        if cand.direction == "LONG":
+            if td8 > 0.18:
+                score += 8
+                reasons.append(f"确认买入延续 {td8:.2f}")
+            if td15 > 0.14:
+                score += 6
+                reasons.append("15s资金持续偏多")
+            if move_8 > 0.0025:
+                score += 8
+                reasons.append(f"确认位移 {move_8*100:.2f}%")
+            if ob > 0.10:
+                score += 6
+                reasons.append(f"盘口继续偏多 {ob:.2f}")
+            if dir_stab > 0.18:
+                score += 4
+                reasons.append("方向持续")
+            if breakout > 0.001:
+                score += 5
+
+            # 否决项
+            if retrace_8 > 0.45:
+                st.candidate = None
+                return None
+            if td8 < 0 or move_8 <= 0:
+                return None
+
+            if score >= 74:
+                last_sent = st.last_signal_ts.get("LONG", 0)
+                if now() - last_sent >= COOLDOWN_SEC:
+                    st.last_signal_ts["LONG"] = now()
+                    st.candidate = None
+                    return "LONG", score, reasons[:6], last_price
+
+        if cand.direction == "SHORT":
+            if td8 < -0.18:
+                score += 8
+                reasons.append(f"确认卖出延续 {td8:.2f}")
+            if td15 < -0.14:
+                score += 6
+                reasons.append("15s资金持续偏空")
+            if move_8 < -0.0025:
+                score += 8
+                reasons.append(f"确认位移 {move_8*100:.2f}%")
+            if ob < -0.10:
+                score += 6
+                reasons.append(f"盘口继续偏空 {ob:.2f}")
+            if dir_stab < -0.18:
+                score += 4
+                reasons.append("方向持续")
+            if breakdown > 0.001:
+                score += 5
+
+            # 否决项
+            if retrace_8 > 0.45:
+                st.candidate = None
+                return None
+            if td8 > 0 or move_8 >= 0:
+                return None
+
+            if score >= 74:
+                last_sent = st.last_signal_ts.get("SHORT", 0)
+                if now() - last_sent >= COOLDOWN_SEC:
+                    st.last_signal_ts["SHORT"] = now()
+                    st.candidate = None
+                    return "SHORT", score, reasons[:6], last_price
+
+        return None
+
+    # -------------------------
+    # 主评估
+    # -------------------------
+
+    def evaluate(self, exchange: str, symbol: str) -> Optional[Tuple[str, float, List[str], float]]:
+        st = self.ensure(exchange, symbol)
+
+        # 先尝试确认已有 candidate
+        confirmed = self._confirm_candidate(st)
+        if confirmed:
+            return confirmed
+
+        # 没有 candidate，则做初筛
+        pre = self._pre_score(st)
+        if not pre:
+            return None
+
+        direction, score, reasons = pre
+
+        # 建立候选，不立刻发
+        if st.candidate is None:
+            st.candidate = CandidateSignal(
+                direction=direction,
+                created_ts=now(),
+                initial_score=score,
+                reasons=reasons,
+            )
+
+        return None
+
+
+# ============================================
+# Gate WS
+# ============================================
+
+class GateWsClient:
+    def __init__(self, symbols: List[str], engine: FilteredSignalEngine, tg_session: aiohttp.ClientSession):
+        self.symbols = symbols
+        self.engine = engine
+        self.tg = tg_session
+
+    async def run(self):
+        while True:
+            try:
+                async with websockets.connect(
+                    GATE_WS,
+                    ping_interval=15,
+                    ping_timeout=10,
+                    max_size=2**23
+                ) as ws:
+                    ts = int(time.time())
+
+                    await ws.send(json.dumps({
+                        "time": ts,
+                        "channel": "spot.trades",
+                        "event": "subscribe",
+                        "payload": self.symbols
+                    }))
+
+                    for sym in self.symbols:
+                        await ws.send(json.dumps({
+                            "time": ts,
+                            "channel": "spot.order_book",
+                            "event": "subscribe",
+                            "payload": [sym, "20", "100ms"]
+                        }))
+
+                    await tg_send(self.tg, f"✅ *Gate WS 已连接*\n监控数: `{len(self.symbols)}`")
+
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        channel = msg.get("channel")
+                        event = msg.get("event")
+                        result = msg.get("result")
+
+                        if event == "subscribe":
+                            continue
+
+                        if channel == "spot.trades" and event == "update":
+                            if isinstance(result, list):
+                                for x in result:
+                                    await self._handle_trade(x)
+                            elif isinstance(result, dict):
+                                await self._handle_trade(result)
+
+                        elif channel == "spot.order_book" and event == "update" and isinstance(result, dict):
+                            await self._handle_book(result)
+
+            except Exception as e:
+                await tg_send(self.tg, f"⚠️ *Gate WS 断开，重连中*\n`{type(e).__name__}: {e}`")
+                await asyncio.sleep(3)
+
+    async def _handle_trade(self, x: dict):
+        sym = x.get("currency_pair")
+        price = safe_float(x.get("price"))
+        amount = safe_float(x.get("amount"))
+        side = "buy" if x.get("side") == "buy" else "sell"
+        ts = safe_float(x.get("create_time_ms")) / 1000 or now()
+
+        if not sym or price <= 0 or amount <= 0:
+            return
+
+        self.engine.on_trade("GATE", sym, price, amount, side, ts)
+        await self._check_signal("GATE", sym)
+
+    async def _handle_book(self, result: dict):
+        sym = result.get("s") or result.get("currency_pair")
+        bids = [(safe_float(x[0]), safe_float(x[1])) for x in result.get("bids", [])]
+        asks = [(safe_float(x[0]), safe_float(x[1])) for x in result.get("asks", [])]
+        ts = safe_float(result.get("t")) / 1000 or now()
+
+        if not sym:
+            return
+
+        self.engine.on_book("GATE", sym, bids, asks, ts)
+        await self._check_signal("GATE", sym)
+
+    async def _check_signal(self, exchange: str, symbol: str):
+        sig = self.engine.evaluate(exchange, symbol)
+        if not sig:
+            return
+
+        side, score, reasons, price = sig
+        emoji = "🟢" if side == "LONG" else "🔴"
+
+        text = (
+            f"{emoji} *关键{side}信号*\n"
+            f"*交易所*: `{exchange}`\n"
+            f"*币种*: `{symbol}`\n"
+            f"*价格*: `{price:.10g}`\n"
+            f"*分数*: `{score:.1f}`\n"
+            f"*原因*:\n" +
+            "\n".join(f"- {r}" for r in reasons) +
+            "\n\n_已过滤套利/对冲/噪音，仍建议人工复核。_"
+        )
+        await tg_send(self.tg, text)
+
+
+# ============================================
+# MEXC WS
+# ============================================
+
+class MexcWsClient:
+    def __init__(self, symbols: List[str], engine: FilteredSignalEngine, tg_session: aiohttp.ClientSession):
+        self.symbols = symbols
+        self.engine = engine
+        self.tg = tg_session
+
+    async def run(self):
+        if not MEXC_PROTO_READY:
+            await tg_send(
+                self.tg,
+                "⚠️ *MEXC WS 未启动*\n缺少 protobuf 生成文件，请先生成 `.proto` 对应 Python 模块。"
+            )
+            return
+
+        tasks = []
+        # 每个 symbol 两个订阅：deals + depth
+        # 1连接最多30订阅，所以每批最多15个 symbol
+        for batch in chunked(self.symbols, 15):
+            tasks.append(asyncio.create_task(self._run_one_conn(batch)))
+
+        await asyncio.gather(*tasks)
+
+    async def _run_one_conn(self, symbols_batch: List[str]):
+        while True:
+            try:
+                async with websockets.connect(
+                    MEXC_WS,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    max_size=2**24
+                ) as ws:
+                    params = []
+                    for sym in symbols_batch:
+                        params.append(f"spot@public.aggre.deals.v3.api.pb@100ms@{sym}")
+                        params.append(f"spot@public.aggre.depth.v3.api.pb@100ms@{sym}")
+
+                    await ws.send(json.dumps({
+                        "method": "SUBSCRIPTION",
+                        "params": params
+                    }))
+
+                    await tg_send(self.tg, f"✅ *MEXC WS 已连接*\n本连接监控: `{len(symbols_batch)}`")
+
+                    async def pinger():
+                        while True:
+                            try:
+                                await ws.send(json.dumps({"method": "PING"}))
+                            except Exception:
+                                return
+                            await asyncio.sleep(20)
+
+                    ping_task = asyncio.create_task(pinger())
+
+                    try:
+                        async for raw in ws:
+                            if isinstance(raw, str):
+                                continue
+                            await self._handle_binary(raw)
+                    finally:
+                        ping_task.cancel()
+
+            except Exception as e:
+                await tg_send(self.tg, f"⚠️ *MEXC WS 断开，重连中*\n`{type(e).__name__}: {e}`")
+                await asyncio.sleep(3)
+
+    async def _handle_binary(self, raw: bytes):
+        wrapper = PushDataV3ApiWrapper_pb2.PushDataV3ApiWrapper()
+        wrapper.ParseFromString(raw)
+
+        channel = wrapper.channel
+        symbol = wrapper.symbol
+
+        if "aggre.deals" in channel:
+            deal_msg = PublicAggreDealsV3Api_pb2.PublicAggreDealsV3Api()
+            deal_msg.ParseFromString(wrapper.data)
+
+            for d in deal_msg.deals:
+                price = safe_float(getattr(d, "p", 0) or getattr(d, "price", 0))
+                qty = safe_float(getattr(d, "v", 0) or getattr(d, "quantity", 0))
+                side_raw = getattr(d, "S", "") or getattr(d, "side", "")
+                side = "buy" if str(side_raw).lower() in ("1", "buy", "bid") else "sell"
+                ts = safe_float(getattr(d, "t", 0) or getattr(d, "time", 0)) / 1000 or now()
+
+                if price > 0 and qty > 0:
+                    self.engine.on_trade("MEXC", symbol, price, qty, side, ts)
+                    await self._check_signal("MEXC", symbol)
+
+        elif "aggre.depth" in channel:
+            depth_msg = PublicAggreDepthsV3Api_pb2.PublicAggreDepthsV3Api()
+            depth_msg.ParseFromString(wrapper.data)
+
+            bids = []
+            asks = []
+
+            for x in depth_msg.bids[:TOP_N_ORDERBOOK]:
+                price = safe_float(getattr(x, "p", 0) or getattr(x, "price", 0))
+                qty = safe_float(getattr(x, "v", 0) or getattr(x, "quantity", 0))
+                bids.append((price, qty))
+
+            for x in depth_msg.asks[:TOP_N_ORDERBOOK]:
+                price = safe_float(getattr(x, "p", 0) or getattr(x, "price", 0))
+                qty = safe_float(getattr(x, "v", 0) or getattr(x, "quantity", 0))
+                asks.append((price, qty))
+
+            ts = safe_float(getattr(depth_msg, "sendTime", 0) or getattr(depth_msg, "t", 0)) / 1000 or now()
+            self.engine.on_book("MEXC", symbol, bids, asks, ts)
+            await self._check_signal("MEXC", symbol)
+
+    async def _check_signal(self, exchange: str, symbol: str):
+        sig = self.engine.evaluate(exchange, symbol)
+        if not sig:
+            return
+
+        side, score, reasons, price = sig
+        emoji = "🟢" if side == "LONG" else "🔴"
+
+        text = (
+            f"{emoji} *关键{side}信号*\n"
+            f"*交易所*: `{exchange}`\n"
+            f"*币种*: `{symbol}`\n"
+            f"*价格*: `{price:.10g}`\n"
+            f"*分数*: `{score:.1f}`\n"
+            f"*原因*:\n" +
+            "\n".join(f"- {r}" for r in reasons) +
+            "\n\n_已过滤套利/对冲/噪音，仍建议人工复核。_"
+        )
+        await tg_send(self.tg, text)
+
+
+# ============================================
+# 主程序
+# ============================================
+
+async def main():
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        gate_symbols, mexc_symbols = await asyncio.gather(
+            gate_pick_similar(session),
+            mexc_pick_similar(session),
+        )
+
+        engine = FilteredSignalEngine()
+
+        await tg_send(
+            session,
+            "🚀 *关键信号监控启动*\n"
+            f"Gate: `{len(gate_symbols)}` 个\n"
+            f"MEXC: `{len(mexc_symbols)}` 个\n"
+            "策略: `过滤套利/对冲/做市噪音，只发关键方向信号`"
+        )
+
+        gate_client = GateWsClient(gate_symbols, engine, session)
+        mexc_client = MexcWsClient(mexc_symbols, engine, session)
+
+        await asyncio.gather(
+            gate_client.run(),
+            mexc_client.run(),
+        )
+
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    asyncio.run(main())
