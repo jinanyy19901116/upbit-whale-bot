@@ -13,7 +13,7 @@ load_dotenv()
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 UPBIT_BASE = "https://api.upbit.com"
-BINANCE_BASE = "https://fapi.binance.com"
+BINANCE_SPOT_BASE = "https://api.binance.com"
 TELEGRAM_BASE = "https://api.telegram.org"
 
 
@@ -75,17 +75,25 @@ class Bot:
         params = {"markets": f"KRW-{base}"}
 
         async with self.session.get(url, params=params) as r:
+            text = await r.text()
             if r.status >= 400:
                 logging.warning(
-                    "Upbit ticker failed | symbol=%s status=%s",
+                    "Upbit ticker failed | symbol=%s status=%s body=%s",
                     symbol,
                     r.status,
+                    text[:300],
                 )
                 return None
+
             data = await r.json()
             if not data:
                 return None
-            return float(data[0]["trade_price"])
+
+            try:
+                return float(data[0]["trade_price"])
+            except (KeyError, TypeError, ValueError):
+                logging.warning("Upbit bad ticker data | symbol=%s body=%s", symbol, data)
+                return None
 
     async def get_usdt_krw(self):
         url = f"{UPBIT_BASE}/v1/ticker"
@@ -95,27 +103,28 @@ class Bot:
             text = await r.text()
             if r.status >= 400:
                 raise RuntimeError(f"无法获取 Upbit KRW-USDT: {r.status} {text[:500]}")
+
             data = await r.json()
             if not data:
                 raise RuntimeError("无法获取 Upbit KRW-USDT: empty response")
+
             return float(data[0]["trade_price"])
 
-    async def load_binance_futures_symbols(self):
-        url = f"{BINANCE_BASE}/fapi/v1/exchangeInfo"
+    async def load_binance_spot_symbols(self):
+        url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
 
         async with self.session.get(url) as r:
             text = await r.text()
-
             if r.status >= 400:
                 raise RuntimeError(
-                    f"Binance exchangeInfo failed: {r.status} {text[:500]}"
+                    f"Binance spot exchangeInfo failed: {r.status} {text[:500]}"
                 )
 
             try:
                 data = await r.json()
             except Exception as e:
                 raise RuntimeError(
-                    f"Binance exchangeInfo JSON parse failed: {e}; body={text[:500]}"
+                    f"Binance spot exchangeInfo JSON parse failed: {e}; body={text[:500]}"
                 )
 
             symbols = set()
@@ -128,7 +137,7 @@ class Bot:
             return symbols
 
     async def get_binance_price(self, symbol):
-        url = f"{BINANCE_BASE}/fapi/v1/ticker/price"
+        url = f"{BINANCE_SPOT_BASE}/api/v3/ticker/price"
         params = {"symbol": symbol}
 
         async with self.session.get(url, params=params) as r:
@@ -136,7 +145,7 @@ class Bot:
 
             if r.status >= 400:
                 logging.warning(
-                    "Binance futures request failed | symbol=%s status=%s body=%s",
+                    "Binance spot request failed | symbol=%s status=%s body=%s",
                     symbol,
                     r.status,
                     text[:500],
@@ -147,7 +156,7 @@ class Bot:
                 data = await r.json()
             except Exception:
                 logging.warning(
-                    "Binance futures bad JSON | symbol=%s body=%s",
+                    "Binance spot bad JSON | symbol=%s body=%s",
                     symbol,
                     text[:500],
                 )
@@ -155,7 +164,7 @@ class Bot:
 
             if "price" not in data:
                 logging.warning(
-                    "Binance futures no price field | symbol=%s body=%s",
+                    "Binance spot no price field | symbol=%s body=%s",
                     symbol,
                     data,
                 )
@@ -165,7 +174,7 @@ class Bot:
                 return float(data["price"])
             except (TypeError, ValueError):
                 logging.warning(
-                    "Binance futures invalid price | symbol=%s body=%s",
+                    "Binance spot invalid price | symbol=%s body=%s",
                     symbol,
                     data,
                 )
@@ -177,14 +186,25 @@ class Bot:
         params = {"market": f"KRW-{base}", "count": 10}
 
         async with self.session.get(url, params=params) as r:
+            text = await r.text()
             if r.status >= 400:
                 logging.warning(
-                    "Upbit candles failed | symbol=%s status=%s",
+                    "Upbit candles failed | symbol=%s status=%s body=%s",
                     symbol,
                     r.status,
+                    text[:300],
                 )
                 return None
-            return await r.json()
+
+            try:
+                return await r.json()
+            except Exception:
+                logging.warning(
+                    "Upbit candles bad JSON | symbol=%s body=%s",
+                    symbol,
+                    text[:300],
+                )
+                return None
 
     def get_signal(self, premium, premium_change, lead, volume_ratio, momentum):
         long_score = 0
@@ -220,7 +240,7 @@ class Bot:
 
     async def process_symbol(self, symbol, usdt_krw):
         if symbol not in self.binance_symbols:
-            logging.info("%s skipped: not in Binance futures exchangeInfo", symbol)
+            logging.info("%s skipped: not in Binance spot exchangeInfo", symbol)
             return
 
         upbit_price = await self.get_upbit_price(symbol)
@@ -230,7 +250,7 @@ class Bot:
 
         binance_price = await self.get_binance_price(symbol)
         if not binance_price or binance_price <= 0:
-            logging.info("%s skipped: no Binance futures price", symbol)
+            logging.info("%s skipped: no Binance spot price", symbol)
             return
 
         candles = await self.get_candles(symbol)
@@ -291,14 +311,15 @@ class Bot:
         if now_ts - self.last_alert_ts.get(alert_key, 0) < COOLDOWN_SECONDS:
             logging.info("%s skipped: cooldown active for %s", symbol, signal)
             return
+
         self.last_alert_ts[alert_key] = now_ts
 
         msg = (
             f"{signal} | {symbol}\n"
             f"时间: {now_bj()} 北京时间\n"
             f"Upbit折算价: {upbit_usdt:.6f}\n"
-            f"Binance价: {binance_price:.6f}\n"
-            f"泡菜溢价: {premium:.2f}%\n"
+            f"Binance现货价: {binance_price:.6f}\n"
+            f"现货溢价: {premium:.2f}%\n"
             f"溢价变化: {premium_change:+.2f}%\n"
             f"量能比: {volume_ratio:.2f}x\n"
             f"短线动能: {momentum:+.2f}%"
@@ -321,29 +342,27 @@ class Bot:
 
         timeout = aiohttp.ClientTimeout(total=20)
         headers = {
-            "User-Agent": "korea-signal-bot/1.0",
+            "User-Agent": "korea-spot-signal-bot/1.0",
             "Accept": "application/json",
         }
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             self.session = session
 
-            logging.info("Starting Korea Signal Bot")
+            logging.info("Starting Korea Spot Signal Bot")
             logging.info("Configured symbols: %s", SYMBOLS)
 
-            self.binance_symbols = await self.load_binance_futures_symbols()
-            logging.info(
-                "Loaded Binance futures symbols: %s",
-                len(self.binance_symbols),
-            )
+            self.binance_symbols = await self.load_binance_spot_symbols()
+            logging.info("Loaded Binance spot symbols: %s", len(self.binance_symbols))
 
             test_symbol = "XRPUSDT"
             test_price = await self.get_binance_price(test_symbol)
-            logging.info("Startup Binance test | %s = %s", test_symbol, test_price)
+            logging.info("Startup Binance spot test | %s = %s", test_symbol, test_price)
 
             await self.send(
                 f"✅ 机器人启动成功\n"
                 f"时间: {now_bj()} 北京时间\n"
+                f"对比市场: Upbit 现货 vs Binance 现货\n"
                 f"监控币种数量: {len(SYMBOLS)}\n"
                 f"监控列表: {', '.join(SYMBOLS)}"
             )
@@ -361,6 +380,7 @@ class Bot:
                         )
                     except Exception:
                         logging.exception("telegram error notify failed")
+
                 await asyncio.sleep(LOOP_SECONDS)
 
 
