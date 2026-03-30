@@ -34,9 +34,9 @@ def parse_symbols(raw: str):
 SYMBOLS = parse_symbols(
     os.getenv(
         "SYMBOLS",
-        "SOLUSDT,DOGEUSDT,ANKRUSDT,ADAUSDT,KITEUSDT,STEEMUSDT,"
-        "XLMUSDT,CHZUSDT,TRXUSDT,BCHUSDT,LINKUSDT,AKTUSDT,"
-        "CPOOLUSDT,SUIUSDT,WLDUSDT,SIGNUSDT"
+        "XRPUSDT,ANKRUSDT,CHZUSDT,XLMUSDT,STEEMUSDT,"
+        "SUIUSDT,WLDUSDT,KITEUSDT,SEIUSDT,AKTUSDT,"
+        "CPOOLUSDT,TRUMPUSDT,ANIMEUSDT"
     )
 )
 
@@ -148,14 +148,17 @@ class Bot:
     async def process_symbol(self, symbol, usdt_krw):
         upbit_price = await self.get_upbit_price(symbol)
         if not upbit_price:
+            logging.info("%s skipped: no Upbit KRW market", symbol)
             return
 
         binance_price = await self.get_binance_price(symbol)
         if not binance_price or binance_price <= 0:
+            logging.info("%s skipped: no Binance futures price", symbol)
             return
 
         candles = await self.get_candles(symbol)
         if not candles or len(candles) < 6:
+            logging.info("%s skipped: not enough Upbit candles", symbol)
             return
 
         try:
@@ -164,6 +167,7 @@ class Bot:
             current_volume = float(candles[0]["candle_acc_trade_volume"])
             current_price = float(candles[0]["trade_price"])
         except (KeyError, TypeError, ValueError):
+            logging.info("%s skipped: bad candle data", symbol)
             return
 
         avg_vol = statistics.mean(volumes) if volumes else 0
@@ -171,7 +175,9 @@ class Bot:
 
         recent_closes = closes[:5] if len(closes) >= 5 else closes
         if not recent_closes:
+            logging.info("%s skipped: no recent closes", symbol)
             return
+
         avg_price = statistics.mean(recent_closes)
         momentum = (current_price / avg_price - 1) * 100 if avg_price > 0 else 0
 
@@ -189,12 +195,24 @@ class Bot:
             volume_ratio=volume_ratio,
             momentum=momentum,
         )
+
+        logging.info(
+            "%s metrics | premium=%.2f%% change=%+.2f%% vol=%.2fx momentum=%+.2f%% signal=%s",
+            symbol,
+            premium,
+            premium_change,
+            volume_ratio,
+            momentum,
+            signal,
+        )
+
         if not signal:
             return
 
         alert_key = f"{symbol}:{signal}"
         now_ts = time.time()
         if now_ts - self.last_alert_ts.get(alert_key, 0) < COOLDOWN_SECONDS:
+            logging.info("%s skipped: cooldown active for %s", symbol, signal)
             return
         self.last_alert_ts[alert_key] = now_ts
 
@@ -209,7 +227,7 @@ class Bot:
             f"短线动能: {momentum:+.2f}%"
         )
 
-        logging.info(msg.replace("\n", " | "))
+        logging.info("SEND | %s", msg.replace("\n", " | "))
         await self.send(msg)
 
     async def run_once(self):
@@ -239,7 +257,8 @@ class Bot:
             await self.send(
                 f"✅ 机器人启动成功\n"
                 f"时间: {now_bj()} 北京时间\n"
-                f"监控币种数量: {len(SYMBOLS)}"
+                f"监控币种数量: {len(SYMBOLS)}\n"
+                f"监控列表: {', '.join(SYMBOLS)}"
             )
 
             while True:
