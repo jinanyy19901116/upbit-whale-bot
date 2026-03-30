@@ -13,7 +13,7 @@ load_dotenv()
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 UPBIT_BASE = "https://api.upbit.com"
-BINANCE_SPOT_BASE = "https://api.binance.com"
+OKX_BASE = "https://www.okx.com"
 TELEGRAM_BASE = "https://api.telegram.org"
 
 
@@ -29,6 +29,14 @@ def parse_symbols(raw: str):
             item = f"{item}USDT"
         result.append(item)
     return result
+
+
+def symbol_to_okx_inst_id(symbol: str) -> str:
+    # XRPUSDT -> XRP-USDT
+    if not symbol.endswith("USDT"):
+        raise ValueError(f"unsupported symbol: {symbol}")
+    base = symbol[:-4]
+    return f"{base}-USDT"
 
 
 SYMBOLS = parse_symbols(
@@ -51,7 +59,7 @@ class Bot:
         self.session = None
         self.last_premium = {}
         self.last_alert_ts = {}
-        self.binance_symbols = set()
+        self.okx_symbols = set()
 
     async def send(self, text):
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -85,7 +93,16 @@ class Bot:
                 )
                 return None
 
-            data = await r.json()
+            try:
+                data = await r.json()
+            except Exception:
+                logging.warning(
+                    "Upbit ticker bad JSON | symbol=%s body=%s",
+                    symbol,
+                    text[:300],
+                )
+                return None
+
             if not data:
                 return None
 
@@ -110,43 +127,47 @@ class Bot:
 
             return float(data[0]["trade_price"])
 
-    async def load_binance_spot_symbols(self):
-        url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
+    async def load_okx_spot_symbols(self):
+        url = f"{OKX_BASE}/api/v5/public/instruments"
+        params = {"instType": "SPOT"}
 
-        async with self.session.get(url) as r:
+        async with self.session.get(url, params=params) as r:
             text = await r.text()
             if r.status >= 400:
-                raise RuntimeError(
-                    f"Binance spot exchangeInfo failed: {r.status} {text[:500]}"
-                )
+                raise RuntimeError(f"OKX spot instruments failed: {r.status} {text[:500]}")
 
             try:
                 data = await r.json()
             except Exception as e:
                 raise RuntimeError(
-                    f"Binance spot exchangeInfo JSON parse failed: {e}; body={text[:500]}"
+                    f"OKX spot instruments JSON parse failed: {e}; body={text[:500]}"
                 )
 
+            if str(data.get("code")) != "0":
+                raise RuntimeError(f"OKX spot instruments returned error: {data}")
+
             symbols = set()
-            for item in data.get("symbols", []):
-                if item.get("status") == "TRADING":
-                    symbol = item.get("symbol")
-                    if symbol:
-                        symbols.add(symbol)
+            for item in data.get("data", []):
+                inst_id = item.get("instId")
+                state = item.get("state")
+                if inst_id and state == "live":
+                    symbols.add(inst_id)
 
             return symbols
 
-    async def get_binance_price(self, symbol):
-        url = f"{BINANCE_SPOT_BASE}/api/v3/ticker/price"
-        params = {"symbol": symbol}
+    async def get_okx_price(self, symbol):
+        inst_id = symbol_to_okx_inst_id(symbol)
+        url = f"{OKX_BASE}/api/v5/market/ticker"
+        params = {"instId": inst_id}
 
         async with self.session.get(url, params=params) as r:
             text = await r.text()
 
             if r.status >= 400:
                 logging.warning(
-                    "Binance spot request failed | symbol=%s status=%s body=%s",
+                    "OKX spot request failed | symbol=%s instId=%s status=%s body=%s",
                     symbol,
+                    inst_id,
                     r.status,
                     text[:500],
                 )
@@ -156,26 +177,39 @@ class Bot:
                 data = await r.json()
             except Exception:
                 logging.warning(
-                    "Binance spot bad JSON | symbol=%s body=%s",
+                    "OKX spot bad JSON | symbol=%s instId=%s body=%s",
                     symbol,
+                    inst_id,
                     text[:500],
                 )
                 return None
 
-            if "price" not in data:
+            if str(data.get("code")) != "0":
                 logging.warning(
-                    "Binance spot no price field | symbol=%s body=%s",
+                    "OKX spot returned error | symbol=%s instId=%s body=%s",
                     symbol,
+                    inst_id,
+                    data,
+                )
+                return None
+
+            rows = data.get("data", [])
+            if not rows:
+                logging.warning(
+                    "OKX spot empty ticker | symbol=%s instId=%s body=%s",
+                    symbol,
+                    inst_id,
                     data,
                 )
                 return None
 
             try:
-                return float(data["price"])
-            except (TypeError, ValueError):
+                return float(rows[0]["last"])
+            except (KeyError, TypeError, ValueError):
                 logging.warning(
-                    "Binance spot invalid price | symbol=%s body=%s",
+                    "OKX spot invalid last price | symbol=%s instId=%s body=%s",
                     symbol,
+                    inst_id,
                     data,
                 )
                 return None
@@ -239,8 +273,9 @@ class Bot:
         return None
 
     async def process_symbol(self, symbol, usdt_krw):
-        if symbol not in self.binance_symbols:
-            logging.info("%s skipped: not in Binance spot exchangeInfo", symbol)
+        okx_inst_id = symbol_to_okx_inst_id(symbol)
+        if okx_inst_id not in self.okx_symbols:
+            logging.info("%s skipped: not in OKX spot instruments", symbol)
             return
 
         upbit_price = await self.get_upbit_price(symbol)
@@ -248,9 +283,9 @@ class Bot:
             logging.info("%s skipped: no Upbit KRW market", symbol)
             return
 
-        binance_price = await self.get_binance_price(symbol)
-        if not binance_price or binance_price <= 0:
-            logging.info("%s skipped: no Binance spot price", symbol)
+        okx_price = await self.get_okx_price(symbol)
+        if not okx_price or okx_price <= 0:
+            logging.info("%s skipped: no OKX spot price", symbol)
             return
 
         candles = await self.get_candles(symbol)
@@ -279,7 +314,7 @@ class Bot:
         momentum = (current_price / avg_price - 1) * 100 if avg_price > 0 else 0
 
         upbit_usdt = upbit_price / usdt_krw
-        premium = (upbit_usdt / binance_price - 1) * 100
+        premium = (upbit_usdt / okx_price - 1) * 100
         prev_premium = self.last_premium.get(symbol, premium)
         premium_change = premium - prev_premium
         self.last_premium[symbol] = premium
@@ -318,7 +353,7 @@ class Bot:
             f"{signal} | {symbol}\n"
             f"时间: {now_bj()} 北京时间\n"
             f"Upbit折算价: {upbit_usdt:.6f}\n"
-            f"Binance现货价: {binance_price:.6f}\n"
+            f"OKX现货价: {okx_price:.6f}\n"
             f"现货溢价: {premium:.2f}%\n"
             f"溢价变化: {premium_change:+.2f}%\n"
             f"量能比: {volume_ratio:.2f}x\n"
@@ -342,27 +377,27 @@ class Bot:
 
         timeout = aiohttp.ClientTimeout(total=20)
         headers = {
-            "User-Agent": "korea-spot-signal-bot/1.0",
+            "User-Agent": "korea-okx-spot-signal-bot/1.0",
             "Accept": "application/json",
         }
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             self.session = session
 
-            logging.info("Starting Korea Spot Signal Bot")
+            logging.info("Starting Korea OKX Spot Signal Bot")
             logging.info("Configured symbols: %s", SYMBOLS)
 
-            self.binance_symbols = await self.load_binance_spot_symbols()
-            logging.info("Loaded Binance spot symbols: %s", len(self.binance_symbols))
+            self.okx_symbols = await self.load_okx_spot_symbols()
+            logging.info("Loaded OKX spot symbols: %s", len(self.okx_symbols))
 
             test_symbol = "XRPUSDT"
-            test_price = await self.get_binance_price(test_symbol)
-            logging.info("Startup Binance spot test | %s = %s", test_symbol, test_price)
+            test_price = await self.get_okx_price(test_symbol)
+            logging.info("Startup OKX spot test | %s = %s", test_symbol, test_price)
 
             await self.send(
                 f"✅ 机器人启动成功\n"
                 f"时间: {now_bj()} 北京时间\n"
-                f"对比市场: Upbit 现货 vs Binance 现货\n"
+                f"对比市场: Upbit 现货 vs OKX 现货\n"
                 f"监控币种数量: {len(SYMBOLS)}\n"
                 f"监控列表: {', '.join(SYMBOLS)}"
             )
