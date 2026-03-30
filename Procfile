@@ -1,0 +1,1 @@
+worker: python -X utf8 main.py
