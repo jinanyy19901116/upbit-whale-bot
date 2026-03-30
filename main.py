@@ -51,6 +51,7 @@ class Bot:
         self.session = None
         self.last_premium = {}
         self.last_alert_ts = {}
+        self.binance_symbols = set()
 
     async def send(self, text):
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -75,6 +76,11 @@ class Bot:
 
         async with self.session.get(url, params=params) as r:
             if r.status >= 400:
+                logging.warning(
+                    "Upbit ticker failed | symbol=%s status=%s",
+                    symbol,
+                    r.status,
+                )
                 return None
             data = await r.json()
             if not data:
@@ -86,22 +92,84 @@ class Bot:
         params = {"markets": "KRW-USDT"}
 
         async with self.session.get(url, params=params) as r:
+            text = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"无法获取 Upbit KRW-USDT: {r.status} {text[:500]}")
             data = await r.json()
             if not data:
-                raise RuntimeError("无法获取 Upbit KRW-USDT")
+                raise RuntimeError("无法获取 Upbit KRW-USDT: empty response")
             return float(data[0]["trade_price"])
+
+    async def load_binance_futures_symbols(self):
+        url = f"{BINANCE_BASE}/fapi/v1/exchangeInfo"
+
+        async with self.session.get(url) as r:
+            text = await r.text()
+
+            if r.status >= 400:
+                raise RuntimeError(
+                    f"Binance exchangeInfo failed: {r.status} {text[:500]}"
+                )
+
+            try:
+                data = await r.json()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Binance exchangeInfo JSON parse failed: {e}; body={text[:500]}"
+                )
+
+            symbols = set()
+            for item in data.get("symbols", []):
+                if item.get("status") == "TRADING":
+                    symbol = item.get("symbol")
+                    if symbol:
+                        symbols.add(symbol)
+
+            return symbols
 
     async def get_binance_price(self, symbol):
         url = f"{BINANCE_BASE}/fapi/v1/ticker/price"
         params = {"symbol": symbol}
 
         async with self.session.get(url, params=params) as r:
+            text = await r.text()
+
             if r.status >= 400:
+                logging.warning(
+                    "Binance futures request failed | symbol=%s status=%s body=%s",
+                    symbol,
+                    r.status,
+                    text[:500],
+                )
                 return None
-            data = await r.json()
+
+            try:
+                data = await r.json()
+            except Exception:
+                logging.warning(
+                    "Binance futures bad JSON | symbol=%s body=%s",
+                    symbol,
+                    text[:500],
+                )
+                return None
+
             if "price" not in data:
+                logging.warning(
+                    "Binance futures no price field | symbol=%s body=%s",
+                    symbol,
+                    data,
+                )
                 return None
-            return float(data["price"])
+
+            try:
+                return float(data["price"])
+            except (TypeError, ValueError):
+                logging.warning(
+                    "Binance futures invalid price | symbol=%s body=%s",
+                    symbol,
+                    data,
+                )
+                return None
 
     async def get_candles(self, symbol):
         base = symbol.replace("USDT", "")
@@ -110,6 +178,11 @@ class Bot:
 
         async with self.session.get(url, params=params) as r:
             if r.status >= 400:
+                logging.warning(
+                    "Upbit candles failed | symbol=%s status=%s",
+                    symbol,
+                    r.status,
+                )
                 return None
             return await r.json()
 
@@ -146,6 +219,10 @@ class Bot:
         return None
 
     async def process_symbol(self, symbol, usdt_krw):
+        if symbol not in self.binance_symbols:
+            logging.info("%s skipped: not in Binance futures exchangeInfo", symbol)
+            return
+
         upbit_price = await self.get_upbit_price(symbol)
         if not upbit_price:
             logging.info("%s skipped: no Upbit KRW market", symbol)
@@ -252,7 +329,17 @@ class Bot:
             self.session = session
 
             logging.info("Starting Korea Signal Bot")
-            logging.info("Active symbols: %s", SYMBOLS)
+            logging.info("Configured symbols: %s", SYMBOLS)
+
+            self.binance_symbols = await self.load_binance_futures_symbols()
+            logging.info(
+                "Loaded Binance futures symbols: %s",
+                len(self.binance_symbols),
+            )
+
+            test_symbol = "XRPUSDT"
+            test_price = await self.get_binance_price(test_symbol)
+            logging.info("Startup Binance test | %s = %s", test_symbol, test_price)
 
             await self.send(
                 f"✅ 机器人启动成功\n"
