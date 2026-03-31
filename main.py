@@ -78,7 +78,7 @@ UPBIT_MARKETS_RAW = os.getenv("UPBIT_MARKETS", "").strip()
 
 # 大单阈值：按 KRW 计
 # 例如 30000000 = 3000万韩元
-BIG_TRADE_KRW = float(os.getenv("BIG_TRADE_KRW", "30000000"))
+BIG_TRADE_KRW = float(os.getenv("BIG_TRADE_KRW", "70000000"))
 
 # 同一币同一方向冷却时间，避免狂刷
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "20"))
