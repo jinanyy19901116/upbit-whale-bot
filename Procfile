@@ -1,1 +1,1 @@
-worker: python -X utf8 main.py
+worker: pip install -r requirements.txt && python -u main.py
