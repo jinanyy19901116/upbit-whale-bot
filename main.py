@@ -1,125 +1,147 @@
-import os
+import asyncio
+import json
 import time
-import requests
-import sys
+import os
+import logging
+from collections import defaultdict, deque
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# ================= 配置区 =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+import aiohttp
+import websockets
+from dotenv import load_dotenv
 
-# 只有溢价超过这个比例才发报警 (3% 比较敏感，5% 比较稳健)
-PREMIUM_THRESHOLD = float(os.getenv("PREMIUM_THRESHOLD", "0.03"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+# 配置
+load_dotenv()
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 垃圾币黑名单 ---
-# 这些币种因为新老币替换、合约不同、或长期关闭充提，会导致数据错误
-BLACKLIST = ["BEAM", "WAVES", "SNT", "ELF", "HIFI", "PLA"] 
-# ==========================================
+# ================= 策略参数（超短线合约适配） =================
+BIG_ORDER_THRESHOLD = 100000  # 10万 USDT 起报
+NET_RATIO_REQ = 3.5           # 买盘需是卖盘 3.5 倍以上
+SQUEEZE_RANGE = 0.003         # 0.3% 以内的窄幅挤压
+CONFIRM_WAIT = 5              # 5秒价格确认
+MAX_SYMBOLS_PER_WS = 150      # 币安单个 WS 建议订阅上限
+# ==========================================================
 
-def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"【待发通知】: {message}", flush=True)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        print(f"❌ Telegram发送失败: {e}", flush=True)
+class UltimateWhaleBot:
+    def __init__(self):
+        self.symbols = []
+        self.history = defaultdict(lambda: deque(maxlen=100))
+        self.prices = defaultdict(lambda: deque(maxlen=60))
+        self.last_alert_time = {}
+        self.session = None
+        self.tele_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-def get_usd_to_krw():
-    try:
-        res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=10).json()
-        return float(res['rates']['KRW'])
-    except:
-        return 1350.0
+    async def get_active_symbols(self):
+        """获取所有币安在线合约交易对"""
+        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+        async with self.session.get(url) as r:
+            data = await r.json()
+            # 过滤只保留 USDT 合约，且状态为 TRADING
+            return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')]
 
-def get_upbit_prices():
-    try:
-        m_url = "https://api.upbit.com/v1/market/all"
-        markets = requests.get(m_url, timeout=10).json()
-        krw_markets = [m['market'] for m in markets if m['market'].startswith('KRW-')]
-        t_url = f"https://api.upbit.com/v1/ticker?markets={','.join(krw_markets)}"
-        tickers = requests.get(t_url, timeout=10).json()
-        return {t['market'].split('-')[1]: float(t['trade_price']) for t in tickers}
-    except Exception as e:
-        print(f"Upbit获取失败: {e}", flush=True)
-        return {}
+    async def init_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
 
-def get_binance_prices():
-    endpoints = [
-        "https://api1.binance.com/api/v3/ticker/price",
-        "https://api3.binance.com/api/v3/ticker/price",
-        "https://api.binance.com/api/v3/ticker/price"
-    ]
-    for url in endpoints:
+    def is_squeezing(self, symbol):
+        """库拉马吉策略核心：检查是否有收缩形态"""
+        p_list = list(self.prices[symbol])
+        if len(p_list) < 30: return False
+        amp = (max(p_list) - min(p_list)) / min(p_list)
+        return amp <= SQUEEZE_RANGE
+
+    def get_flow_stats(self, symbol):
+        """计算资金合力"""
+        now = time.time()
+        trades = [t for t in self.history[symbol] if now - t['ts'] < 60]
+        buys = sum(t['amt'] for t in trades if t['side'] == 'buy')
+        sells = sum(t['amt'] for t in trades if t['side'] == 'sell')
+        if sells == 0: return ("BUY", buys, 99) if buys > 0 else (None, 0, 0)
+        return ("BUY" if buys/sells > NET_RATIO_REQ else None), (buys - sells), (buys/sells)
+
+    async def send_tg(self, msg):
+        if not self.tele_token: logging.info(msg); return
+        url = f"https://api.telegram.org/bot{self.tele_token}/sendMessage"
         try:
-            res = requests.get(url, timeout=10)
-            data = res.json()
-            if isinstance(data, list):
-                return {item['symbol'].replace('USDT', ''): float(item['price']) 
-                        for item in data if item.get('symbol', '').endswith('USDT')}
-        except:
-            continue
-    return {}
+            await self.session.post(url, json={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"})
+        except Exception as e: logging.error(f"TG Error: {e}")
 
-def monitor():
-    print(f"🚀 自动过滤版监控启动...", flush=True)
-    send_telegram_alert("🤖 <b>监控已升级：自动过滤垃圾币模式</b>\n已屏蔽 BEAM/WAVES 等异常币种。")
-
-    while True:
-        try:
-            rate = get_usd_to_krw()
-            up_data = get_upbit_prices()
-            bin_data = get_binance_prices()
-            
-            common_coins = set(up_data.keys()) & set(bin_data.keys())
-            
-            valid_stats = []
-            alerts = []
-
-            for coin in common_coins:
-                # 1. 检查黑名单
-                if coin in BLACKLIST:
-                    continue
-                
-                u_price = up_data[coin]
-                b_price = bin_data[coin]
-                
-                if b_price > 0:
-                    b_price_krw = b_price * rate
-                    premium = (u_price - b_price_krw) / b_price_krw
-                    
-                    # 2. 极端异常值过滤：
-                    # 如果溢价绝对值超过 40%，基本可以断定该币种在 Upbit 处于“单机”或“维护”状态。
-                    if abs(premium) > 0.40:
-                        continue
-                    
-                    valid_stats.append({'coin': coin, 'p': premium})
-                    
-                    # 3. 报警判断
-                    if abs(premium) >= PREMIUM_THRESHOLD:
-                        emoji = "🚨" if premium > 0 else "📉"
-                        alerts.append(
-                            f"{emoji} <b>{coin}</b>\n"
-                            f"溢价: <code>{premium*100:.2f}%</code>\n"
-                            f"Upbit: {u_price:,.0f} | Bin: ${b_price:,.4f}"
-                        )
-
-            if alerts:
-                for i in range(0, len(alerts), 5):
-                    send_telegram_alert("<b>【实时异动】</b>\n\n" + "\n\n".join(alerts[i:i+5]))
-                    time.sleep(1)
-
-            # 日志显示正常的前三名
-            top3 = sorted(valid_stats, key=lambda x: x['p'], reverse=True)[:3]
-            top3_str = " | ".join([f"{item['coin']}:{item['p']*100:.1f}%" for item in top3])
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 有效币数:{len(valid_stats)} | 最高:{top3_str}", flush=True)
-
-        except Exception as e:
-            print(f"❌ 运行异常: {e}", flush=True)
+    async def process_signal(self, symbol, entry_p):
+        """库拉马吉确认逻辑"""
+        # 1. 检查是否在窄幅震荡（挤压阶段）
+        if not self.is_squeezing(symbol): return
         
-        time.sleep(CHECK_INTERVAL)
+        # 2. 冷却逻辑，防止同一个币刷屏
+        if time.time() - self.last_alert_time.get(symbol, 0) < 300: return
+
+        # 3. 价格确认期
+        await asyncio.sleep(CONFIRM_WAIT)
+        
+        curr_p = list(self.prices[symbol])[-1] if self.prices[symbol] else entry_p
+        side, net_flow, ratio = self.get_flow_stats(symbol)
+        
+        # 4. 最终判定：资金合力+价格站稳
+        if side == "BUY" and curr_p > entry_p * 1.001:
+            self.last_alert_time[symbol] = time.time()
+            tp, sl = curr_p * 1.015, curr_p * 0.994 # 1.5% 止盈, 0.6% 止损
+            
+            text = (
+                f"🌟 <b>【全网合约·库拉马吉突破】</b>\n"
+                f"<b>标的:</b> #{symbol}\n"
+                f"<b>资金:</b> 净流入 {net_flow/10000:.1f}万 ({ratio:.1f}倍)\n"
+                f"<b>形态:</b> 窄幅收缩后放量突破 ✅\n"
+                f"------------------------\n"
+                f"<b>🎯 建议入场价:</b> {curr_p:.6f}\n"
+                f"<b>💰 建议止盈:</b> {tp:.6f}\n"
+                f"<b>🛡 建议止损:</b> {sl:.6f}\n"
+                f"------------------------\n"
+                f"提示：库拉马吉策略核心在于‘追强杀弱’，入场后跌破止损即离场。"
+            )
+            await self.send_tg(text)
+
+    async def subscribe_ws(self, symbols_chunk):
+        """订阅币安聚合成交流"""
+        streams = "/".join([f"{s.lower()}@aggTrade" for s in symbols_chunk])
+        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        
+        while True:
+            try:
+                async with websockets.connect(url) as ws:
+                    logging.info(f"成功订阅 {len(symbols_chunk)} 个币种")
+                    while True:
+                        res = await ws.recv()
+                        data = json.loads(res)['data']
+                        symbol, p, q = data['s'], float(data['p']), float(data['q'])
+                        amt = p * q
+                        
+                        self.prices[symbol].append(p)
+                        side = "sell" if data['m'] else "buy"
+                        self.history[symbol].append({'ts': time.time(), 'side': side, 'amt': amt})
+                        
+                        if amt >= BIG_ORDER_THRESHOLD and side == "buy":
+                            asyncio.create_task(self.process_signal(symbol, p))
+            except Exception as e:
+                logging.error(f"WS连接异常: {e}, 5秒后重连...")
+                await asyncio.sleep(5)
+
+    async def main(self):
+        await self.init_session()
+        # 1. 获取全币种
+        all_symbols = await self.get_active_symbols()
+        logging.info(f"检测到 {len(all_symbols)} 个活跃合约对")
+        
+        # 2. 分块订阅（防止超过币安 WS 限制）
+        chunks = [all_symbols[i:i + MAX_SYMBOLS_PER_WS] for i in range(0, len(all_symbols), MAX_SYMBOLS_PER_WS)]
+        
+        tasks = [self.subscribe_ws(chunk) for chunk in chunks]
+        await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    monitor()
+    bot = UltimateWhaleBot()
+    try:
+        asyncio.run(bot.main())
+    except KeyboardInterrupt:
+        pass
